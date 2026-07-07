@@ -209,7 +209,7 @@ func RunStatusBucketAccessClaim(cmd *cobra.Command, args []string) {
 		log.Fatalf(`❌ Could not find COSI bucket access claim secret %q in namespace %q`, secret.Name, cosiBucketAccessClaim.Namespace)
 	}
 
-	sysClient, err := system.Connect(true)
+	sysClient, err := system.ConnectAuto()
 	if err != nil {
 		util.Logger().Fatalf("❌ %s", err)
 	}
@@ -313,7 +313,7 @@ func WaitBucketAccessClaimReady(cosiBucketAccessClaim *nbv1.COSIBucketAccessClai
 	retries := 0
 	err := wait.PollUntilContextCancel(ctx, interval*time.Second, true, func(ctx context.Context) (bool, error) {
 		if retries == maxRetries {
-			return false, fmt.Errorf("COSI bucket claim is not ready after max retries - %q", maxRetries)
+			return false, fmt.Errorf("COSI bucket claim is not ready after max retries - %d", maxRetries)
 		}
 		retries++
 		err := klient.Get(util.Context(), util.ObjectKey(cosiBucketAccessClaim), cosiBucketAccessClaim)

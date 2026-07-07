@@ -102,6 +102,10 @@ func CmdRun() *cobra.Command {
 
 // RunUpgrade runs a CLI command
 func RunUpgrade(cmd *cobra.Command, args []string) {
+	if err := validateGCPWIFFlags(cmd); err != nil {
+		util.Logger().Fatalf("Invalid GCP WIF (STS) upgrade flags: %v", err)
+	}
+
 	c := LoadOperatorConf(cmd)
 	util.KubeApply(c.NS)
 	util.KubeApply(c.SA)
@@ -191,6 +195,8 @@ func RunUpgrade(cmd *cobra.Command, args []string) {
 		c.Deployment.Spec.Template.Spec.Containers[0].Env = operatorContainer.Env
 	}
 
+	appendGCPWIFEnvVars(&c.Deployment.Spec.Template.Spec.Containers[0], cmd)
+
 	noDeploy, _ := cmd.Flags().GetBool("no-deploy")
 	if !noDeploy {
 		operatorContainer := c.Deployment.Spec.Template.Spec.Containers[0]
@@ -208,6 +214,10 @@ func RunUpgrade(cmd *cobra.Command, args []string) {
 
 // RunInstall runs a CLI command
 func RunInstall(cmd *cobra.Command, args []string) {
+	if err := validateGCPWIFFlags(cmd); err != nil {
+		util.Logger().Fatalf("Invalid GCP WIF (STS) install flags: %v", err)
+	}
+
 	c := LoadOperatorConf(cmd)
 	util.KubeCreateSkipExisting(c.NS)
 	util.KubeCreateSkipExisting(c.SA)
@@ -305,6 +315,8 @@ func RunInstall(cmd *cobra.Command, args []string) {
 		})
 		c.Deployment.Spec.Template.Spec.Containers[0].Env = operatorContainer.Env
 	}
+
+	appendGCPWIFEnvVars(&c.Deployment.Spec.Template.Spec.Containers[0], cmd)
 
 	noDeploy, _ := cmd.Flags().GetBool("no-deploy")
 	if !noDeploy {
@@ -689,4 +701,34 @@ func AdmissionWebhookSetup(c *Conf) {
 
 func configureClusterRole(cr *rbacv1.ClusterRole) {
 	cr.Name = options.SubDomainNS()
+}
+
+func validateGCPWIFFlags(cmd *cobra.Command) error {
+	projectNumber, _ := cmd.Flags().GetString("google-cloud-project-number")
+	poolID, _ := cmd.Flags().GetString("google-cloud-pool-id")
+	providerID, _ := cmd.Flags().GetString("google-cloud-provider-id")
+	serviceAccountEmail, _ := cmd.Flags().GetString("google-cloud-service-account-email")
+	return util.ValidateGCPWIFParams(projectNumber, poolID, providerID, serviceAccountEmail)
+}
+
+// appendGCPWIFEnvVars appends GCP WIF (STS) environment variables to the operator container
+func appendGCPWIFEnvVars(operatorContainer *corev1.Container, cmd *cobra.Command) {
+	// flag to env var mapping
+	for _, flagEnv := range []struct {
+		envName string
+		flag    string
+	}{
+		{"PROJECT_NUMBER", "google-cloud-project-number"},
+		{"POOL_ID", "google-cloud-pool-id"},
+		{"PROVIDER_ID", "google-cloud-provider-id"},
+		{"SERVICE_ACCOUNT_EMAIL", "google-cloud-service-account-email"},
+	} {
+		value, _ := cmd.Flags().GetString(flagEnv.flag)
+		if value != "" {
+			operatorContainer.Env = append(operatorContainer.Env, corev1.EnvVar{
+				Name:  flagEnv.envName,
+				Value: value,
+			})
+		}
+	}
 }

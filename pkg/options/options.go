@@ -30,7 +30,7 @@ const (
 	// ContainerImageRepo is the repo of the default image url
 	ContainerImageRepo = "noobaa-core"
 	// ContainerImageTag is the tag of the default image url
-	ContainerImageTag = "master-20260408"
+	ContainerImageTag = "master-20260603"
 	// ContainerImageSemverLowerBound is the lower bound for supported image versions
 	ContainerImageSemverLowerBound = "5.0.0"
 	// ContainerImageSemverUpperBound is the upper bound for supported image versions
@@ -76,7 +76,7 @@ var DBImage = "quay.io/sclorg/postgresql-16-c9s"
 var PostgresMajorVersion = 16
 
 // PostgresInstances is the default number of postgres instances in a managed postgres cluster
-var PostgresInstances = 2
+var PostgresInstances = 1
 
 // Psql12Image is the default postgres12 db image url
 // currently it can not be overridden.
@@ -116,6 +116,9 @@ var PostgresSSLCert = ""
 
 // DebugLevel can be used to override the default debug level
 var DebugLevel = "default_level"
+
+// OperatorLogLevel controls the operator process log verbosity (warn/info/debug)
+var OperatorLogLevel = "info"
 
 // PVPoolDefaultStorageClass is used for PVC's allocation for the noobaa server data
 // it can be overridden for testing or different PV providers.
@@ -181,10 +184,10 @@ var PrometheusNamespace = ""
 var AWSSTSARN = ""
 
 // CnpgVersion is the version of cloudnative-pg operator to use
-var CnpgVersion = "1.27.0"
+var CnpgVersion = "1.29.1"
 
 // CnpgImage is the container image url of cloudnative-pg operator
-var CnpgImage = "quay.io/noobaa/cloudnative-pg-noobaa:v1.25.0"
+var CnpgImage = "quay.io/rhceph-dev/odf4-odf-cloudnative-pg-rhel9-operator:v4.22"
 
 // UseCnpgApiGroup indicates if the original CloudNativePG API group should be used for the installation manifests
 // Relevant for the CLI commands. during reconciliation we look at the env variable USE_CNPG_API_GROUP to determine
@@ -209,6 +212,22 @@ var SubscriptionId = ""
 // ResourcegroupId is used in a creating storageaccount
 // it can be overridden for testing.
 var ResourcegroupId = ""
+
+// GoogleCloudProjectNumber is used on a GCP WIF (STS) cluster.
+// it can be overridden for testing.
+var GoogleCloudProjectNumber = ""
+
+// GoogleCloudPoolId is used on a GCP WIF (STS) cluster.
+// it can be overridden for testing.
+var GoogleCloudPoolId = ""
+
+// GoogleCloudProviderId is used on a GCP WIF (STS) cluster.
+// it can be overridden for testing.
+var GoogleCloudProviderId = ""
+
+// GoogleCloudServiceAccountEmail is used on a GCP WIF (STS) cluster.
+// it can be overridden for testing.
+var GoogleCloudServiceAccountEmail = ""
 
 // SubDomainNS returns a unique subdomain for the namespace
 func SubDomainNS() string {
@@ -274,6 +293,10 @@ func init() {
 		&DBVolumeSizeGB, "db-volume-size-gb",
 		DBVolumeSizeGB, "The database volume size in GB",
 	)
+	FlagSet.IntVar(
+		&PostgresInstances, "postgres-instances",
+		PostgresInstances, "The number of postgres instances",
+	)
 	FlagSet.StringVar(
 		&DBStorageClass, "db-storage-class",
 		DBStorageClass, "The database volume storage class name",
@@ -301,6 +324,10 @@ func init() {
 	FlagSet.StringVar(
 		&DebugLevel, "debug-level",
 		DebugLevel, "The type of debug sets that the system prints (all, nsfs, warn, default_level)",
+	)
+	FlagSet.StringVar(
+		&OperatorLogLevel, "operator-log-level",
+		OperatorLogLevel, "The operator process log verbosity (warn, info, debug)",
 	)
 	FlagSet.StringVar(
 		&PVPoolDefaultStorageClass, "pv-pool-default-storage-class",
@@ -397,5 +424,21 @@ func init() {
 	FlagSet.StringVar(
 		&ResourcegroupId, "azure-resourcegroup",
 		ResourcegroupId, "The Azure STS resource group name",
+	)
+	FlagSet.StringVar(
+		&GoogleCloudProjectNumber, "google-cloud-project-number",
+		GoogleCloudProjectNumber, "The GCP WIF (STS) project number",
+	)
+	FlagSet.StringVar(
+		&GoogleCloudPoolId, "google-cloud-pool-id",
+		GoogleCloudPoolId, "The GCP WIF (STS) pool ID",
+	)
+	FlagSet.StringVar(
+		&GoogleCloudProviderId, "google-cloud-provider-id",
+		GoogleCloudProviderId, "The GCP WIF (STS) provider ID",
+	)
+	FlagSet.StringVar(
+		&GoogleCloudServiceAccountEmail, "google-cloud-service-account-email",
+		GoogleCloudServiceAccountEmail, "The GCP WIF (STS) service account email",
 	)
 }

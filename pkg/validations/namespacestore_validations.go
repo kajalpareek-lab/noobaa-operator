@@ -30,6 +30,9 @@ func ValidateNamespaceStore(nsStore *nbv1.NamespaceStore) error {
 	if err := ValidateNSEmptyTargetBucket(*nsStore); err != nil {
 		return err
 	}
+	if err := ValidateNSArchiveSpec(*nsStore); err != nil {
+		return err
+	}
 	switch nsStore.Spec.Type {
 
 	case nbv1.NSStoreTypeNSFS:
@@ -278,6 +281,18 @@ func ValidateEndPoint(endPointPointer *string) error {
 	return nil
 }
 
+// EndpointsEquivalent validates whether two endpoint strings are equivalent after normalization
+func EndpointsEquivalent(endpointA, endpointB string) (bool, error) {
+	a, b := endpointA, endpointB
+	if err := ValidateEndPoint(&a); err != nil {
+		return false, err
+	}
+	if err := ValidateEndPoint(&b); err != nil {
+		return false, err
+	}
+	return a == b, nil
+}
+
 // ValidateNSEmptySecretName validates a secret name is provided for cloud namespacestore
 func ValidateNSEmptySecretName(ns nbv1.NamespaceStore) error {
 	switch ns.Spec.Type {
@@ -406,6 +421,55 @@ func ValidateTargetNSBucketChange(ns nbv1.NamespaceStore, oldNs nbv1.NamespaceSt
 	default:
 		return util.ValidationError{
 			Msg: "Failed to identify NamespaceStore type",
+		}
+	}
+	return nil
+}
+
+// ValidateNSArchiveSpec validates archive flag usage on a NamespaceStore.
+func ValidateNSArchiveSpec(nsStore nbv1.NamespaceStore) error {
+	if !nsStore.Spec.Archive {
+		return nil
+	}
+	if nsStore.Spec.Type != nbv1.NSStoreTypeS3Compatible {
+		return util.ValidationError{
+			Msg: "archive can only be set on s3-compatible type NamespaceStore",
+		}
+	}
+	if nsStore.Spec.S3Compatible == nil {
+		return util.ValidationError{
+			Msg: "S3Compatible spec must be provided when archive is enabled",
+		}
+	}
+	return nil
+}
+
+// ValidateNSEndpointChange validates the user is not trying to update the namespacestore endpoint
+func ValidateNSEndpointChange(ns nbv1.NamespaceStore, oldNs nbv1.NamespaceStore) error {
+	switch ns.Spec.Type {
+	case nbv1.NSStoreTypeS3Compatible:
+		if oldNs.Spec.S3Compatible != nil && ns.Spec.S3Compatible != nil {
+			equal, err := EndpointsEquivalent(oldNs.Spec.S3Compatible.Endpoint, ns.Spec.S3Compatible.Endpoint)
+			if err != nil {
+				return err
+			}
+			if !equal {
+				return util.ValidationError{
+					Msg: "Changing a NamespaceStore endpoint is unsupported; delete and re-create the NamespaceStore",
+				}
+			}
+		}
+	case nbv1.NSStoreTypeIBMCos:
+		if oldNs.Spec.IBMCos != nil && ns.Spec.IBMCos != nil {
+			equal, err := EndpointsEquivalent(oldNs.Spec.IBMCos.Endpoint, ns.Spec.IBMCos.Endpoint)
+			if err != nil {
+				return err
+			}
+			if !equal {
+				return util.ValidationError{
+					Msg: "Changing a NamespaceStore endpoint is unsupported; delete and re-create the NamespaceStore",
+				}
+			}
 		}
 	}
 	return nil

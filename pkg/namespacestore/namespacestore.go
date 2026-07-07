@@ -59,6 +59,7 @@ func CmdCreate() *cobra.Command {
 		CmdCreateAWSS3(),
 		CmdCreateAWSSTSS3(),
 		CmdCreateGoogleCloudStorage(),
+		CmdCreateGoogleCloudStorageSTS(),
 		CmdCreateS3Compatible(),
 		CmdCreateIBMCos(),
 		CmdCreateAzureBlob(),
@@ -142,7 +143,42 @@ func CmdCreateGoogleCloudStorage() *cobra.Command {
 	)
 	cmd.Flags().String(
 		"secret-name", "",
-		`The name of a secret for authentication - should have GoogleServiceAccountPrivateKeyJson property`,
+		`The name of a secret for authentication - should have `+util.GoogleServiceAccountPrivateKeyJson+` property`,
+	)
+	return cmd
+}
+
+// CmdCreateGoogleCloudStorageSTS returns a CLI command
+func CmdCreateGoogleCloudStorageSTS() *cobra.Command {
+	cmd := &cobra.Command{
+		Hidden: true, //TODO: remove once we want to expose it.
+		Use:    "google-cloud-storage-sts <namespace-store-name>",
+		Short:  "Create google-cloud-storage namespace store using GCP WIF (STS, short-lived credentials)",
+		Run:    RunCreateGoogleCloudStorageSTS,
+	}
+	cmd.Flags().String(
+		"target-bucket", "",
+		"The target bucket name on Google cloud storage",
+	)
+	cmd.Flags().String(
+		"service-account-email", "",
+		"The GCP service account email to impersonate",
+	)
+	cmd.Flags().String(
+		"project-number", "",
+		"The GCP project number (numeric string, e.g. 123456789; not the project ID)",
+	)
+	cmd.Flags().String(
+		"pool-id", "",
+		"The GCP workload identity pool ID",
+	)
+	cmd.Flags().String(
+		"provider-id", "",
+		"The GCP workload identity provider ID",
+	)
+	cmd.Flags().String(
+		"secret-name", "",
+		`The name of a secret for authentication - should have `+util.GoogleCredentialsJson+` property (external_account JSON)`,
 	)
 	return cmd
 }
@@ -181,6 +217,10 @@ func CmdCreateS3Compatible() *cobra.Command {
 	cmd.Flags().String(
 		"access-mode", "read-write",
 		`The resource access privileges read-write|read-only`,
+	)
+	cmd.Flags().Bool(
+		"archive", false,
+		"Mark the namespace store for cold-storage archive use (IBM Deep Archive)",
 	)
 	return cmd
 }
@@ -561,7 +601,7 @@ func RunCreateGoogleCloudStorage(cmd *cobra.Command, args []string) {
 	createCommon(cmd, args, nbv1.NSStoreTypeGoogleCloudStorage, func(namespaceStore *nbv1.NamespaceStore, secret *corev1.Secret) {
 		targetBucket := util.GetFlagStringOrPrompt(cmd, "target-bucket")
 		secretName, _ := cmd.Flags().GetString("secret-name")
-		mandatoryProperties := []string{"GoogleServiceAccountPrivateKeyJson"}
+		mandatoryProperties := []string{util.GoogleServiceAccountPrivateKeyJson}
 
 		if secretName == "" {
 			privateKeyJSONFile := util.GetFlagStringOrPrompt(cmd, "private-key-json-file")
@@ -574,9 +614,50 @@ func RunCreateGoogleCloudStorage(cmd *cobra.Command, args []string) {
 			if err != nil {
 				log.Fatalf("Failed to parse json file %q: %v", privateKeyJSONFile, err)
 			}
-			secret.StringData["GoogleServiceAccountPrivateKeyJson"] = string(bytes)
+			credentialsType, ok := privateKeyJSON["type"].(string)
+			if !ok || credentialsType != "service_account" {
+				log.Fatalf("GCP credentials JSON 'type' field must be a string with value %q", "service_account")
+			}
+			secret.StringData[util.GoogleServiceAccountPrivateKeyJson] = string(bytes)
 		} else {
 			util.VerifyCredsInSecret(secretName, options.Namespace, mandatoryProperties)
+			util.VerifyGoogleCredentialsJSONTypeInSecret(secretName, options.Namespace, false)
+			secret.Name = secretName
+			secret.Namespace = options.Namespace
+		}
+
+		namespaceStore.Spec.GoogleCloudStorage = &nbv1.GoogleCloudStorageSpec{
+			TargetBucket: targetBucket,
+			Secret: corev1.SecretReference{
+				Name:      secret.Name,
+				Namespace: secret.Namespace,
+			},
+		}
+	})
+}
+
+// RunCreateGoogleCloudStorageSTS runs a CLI command
+func RunCreateGoogleCloudStorageSTS(cmd *cobra.Command, args []string) {
+	log := util.Logger()
+	createCommon(cmd, args, nbv1.NSStoreTypeGoogleCloudStorage, func(namespaceStore *nbv1.NamespaceStore, secret *corev1.Secret) {
+		targetBucket := util.GetFlagStringOrPrompt(cmd, "target-bucket")
+		secretName, _ := cmd.Flags().GetString("secret-name")
+		mandatoryProperties := []string{util.GoogleCredentialsJson}
+
+		if secretName == "" {
+			projectNumber := util.GetFlagStringOrPrompt(cmd, "project-number")
+			poolID := util.GetFlagStringOrPrompt(cmd, "pool-id")
+			providerID := util.GetFlagStringOrPrompt(cmd, "provider-id")
+			serviceAccountEmail := util.GetFlagStringOrPrompt(cmd, "service-account-email")
+			credentialsJSON, err := util.BuildGoogleWIFCredentialsJSON(projectNumber,
+				poolID, providerID, serviceAccountEmail)
+			if err != nil {
+				log.Fatalf("Failed to build GCP WIF credentials: %v", err)
+			}
+			secret.StringData[util.GoogleCredentialsJson] = credentialsJSON
+		} else {
+			util.VerifyCredsInSecret(secretName, options.Namespace, mandatoryProperties)
+			util.VerifyGoogleCredentialsJSONTypeInSecret(secretName, options.Namespace, true)
 			secret.Name = secretName
 			secret.Namespace = options.Namespace
 		}
@@ -595,6 +676,7 @@ func RunCreateGoogleCloudStorage(cmd *cobra.Command, args []string) {
 func RunCreateS3Compatible(cmd *cobra.Command, args []string) {
 	createCommon(cmd, args, nbv1.NSStoreTypeS3Compatible, func(namespaceStore *nbv1.NamespaceStore, secret *corev1.Secret) {
 		log := util.Logger()
+		archive, _ := cmd.Flags().GetBool("archive")
 		endpoint := util.GetFlagStringOrPrompt(cmd, "endpoint")
 		targetBucket := util.GetFlagStringOrPrompt(cmd, "target-bucket")
 		sigVer, _ := cmd.Flags().GetString("signature-version")
@@ -631,6 +713,7 @@ func RunCreateS3Compatible(cmd *cobra.Command, args []string) {
 				Namespace: secret.Namespace,
 			},
 		}
+		namespaceStore.Spec.Archive = archive
 	})
 }
 
@@ -807,7 +890,7 @@ func RunStatus(cmd *cobra.Command, args []string) {
 
 	secret := util.KubeObject(bundle.File_deploy_internal_secret_empty_yaml).(*corev1.Secret)
 	secretRef, _ := util.GetNamespaceStoreSecret(namespaceStore)
-	if !util.IsSTSClusterNS(namespaceStore) && !util.IsAzureSTSClusterNS(namespaceStore) {
+	if !util.IsAWSSTSClusterNS(namespaceStore) && !util.IsAzureSTSClusterNS(namespaceStore) {
 		if secretRef != nil {
 			secret.Name = secretRef.Name
 			secret.Namespace = secretRef.Namespace
@@ -915,6 +998,15 @@ func CheckPhase(namespaceStore *nbv1.NamespaceStore) {
 	}
 }
 
+// providerStorageClass returns the provider storage-class label for a NamespaceStore row.
+// Only s3-compatible stores carry the archive distinction; all other types return "-".
+func providerStorageClass(ns *nbv1.NamespaceStore) string {
+	if util.IsArchiveNamespaceStore(ns) {
+		return "archive"
+	}
+	return "standard"
+}
+
 // RunList runs a CLI command
 func RunList(cmd *cobra.Command, args []string) {
 	list := &nbv1.NamespaceStoreList{
@@ -931,6 +1023,7 @@ func RunList(cmd *cobra.Command, args []string) {
 		"NAME",
 		"TYPE",
 		"TARGET-BUCKET",
+		"PROVIDER-STORAGE-CLASS",
 		"PHASE",
 		"AGE",
 	)
@@ -942,6 +1035,7 @@ func RunList(cmd *cobra.Command, args []string) {
 				bs.Name,
 				string(bs.Spec.Type),
 				tb,
+				providerStorageClass(bs),
 				string(bs.Status.Phase),
 				util.HumanizeDuration(time.Since(bs.CreationTimestamp.Time).Round(time.Second)),
 			)

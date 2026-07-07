@@ -24,6 +24,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -93,6 +94,20 @@ const (
 
 	// InjectedBundleCertCAFile points to OCP root CA to be added to the default root CA list
 	InjectedBundleCertCAFile = "/etc/ocp-injected-ca-bundle/ca-bundle.crt"
+
+	// WebIdentityTokenPath is the projected service account token path used for AWS/Azure/GCP STS.
+	WebIdentityTokenPath = "/var/run/secrets/openshift/serviceaccount/token"
+
+	// Google impersonation URL constants
+	GoogleImpersonationURLPrefix = "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/"
+	GoogleImpersonationURLSuffix = ":generateAccessToken"
+
+	gcpServiceAccountEmailSuffix = ".iam.gserviceaccount.com"
+
+	// GoogleServiceAccountPrivateKeyJson is the secret data key for classic GCP (service_account) credentials.
+	GoogleServiceAccountPrivateKeyJson = "GoogleServiceAccountPrivateKeyJson"
+	// GoogleCredentialsJson is the secret data key for GCP WIF (external_account) credentials.
+	GoogleCredentialsJson = "GoogleCredentialsJson"
 )
 
 // OAuth2Endpoints holds OAuth2 endpoints information.
@@ -106,11 +121,42 @@ type ValidationError struct {
 	Msg string
 }
 
+// googleCredentialsJSON is a minimal view of Google credential JSON (service_account or external_account).
+type googleCredentialsJSON struct {
+	Type                           string `json:"type"`
+	PrivateKeyID                   string `json:"private_key_id,omitempty"`
+	ServiceAccountImpersonationURL string `json:"service_account_impersonation_url,omitempty"`
+}
+
+// googleCredentialsJSONFullSTS represents the complete structure of GCP Workload Identity Federation credentials
+type googleCredentialsJSONFullSTS struct {
+	Type                           string                    `json:"type"`
+	Audience                       string                    `json:"audience"`
+	SubjectTokenType               string                    `json:"subject_token_type"`
+	TokenURL                       string                    `json:"token_url"`
+	ServiceAccountImpersonationURL string                    `json:"service_account_impersonation_url"`
+	CredentialSource               googleWIFCredentialSource `json:"credential_source"`
+}
+
+type googleWIFCredentialSource struct {
+	File   string            `json:"file"`
+	Format map[string]string `json:"format"`
+}
+
 // AccessKeyRegexp validates access keys, which are 20 characters long and may include alphanumeric characters
 var AccessKeyRegexp, _ = regexp.Compile(`^[a-zA-Z0-9]{20}$`)
 
 // SecretKeyRegexp validates secret keys, which are 40 characters long and may include alphanumeric characters '+' and '/'
 var SecretKeyRegexp, _ = regexp.Compile(`^[a-zA-Z0-9+/]{40}$`)
+
+var (
+	// project number should be a numeric string
+	gcpProjectNumberRegexp = regexp.MustCompile(`^[0-9]+$`)
+	// pool ID and provider ID contain only lowercase alphanumeric characters and dashes, and start and end with an alphanumeric character
+	gcpWIFPoolOrProviderIDRegexp = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{2,30}[a-z0-9])?$`)
+	// service account ID contains lowercase alphanumeric characters and dashes
+	gcpServiceAccountIDRegexp = regexp.MustCompile(`^[a-z]([-a-z0-9]*[a-z0-9])$`)
+)
 
 // IsValidationError check if err is of type ValidationError
 func IsValidationError(err error) bool {
@@ -142,13 +188,13 @@ var (
 	// MapStorTypeToMandatoryProperties holds a map of store type -> credentials mandatory properties
 	// note that this map holds the mandatory properties for both backingstores and namespacestores
 	MapStorTypeToMandatoryProperties = map[string][]string{
-		"aws-s3":               {"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"},         // backingstores and namespacestores
-		"s3-compatible":        {"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"},         // backingstores and namespacestores
-		"ibm-cos":              {"IBM_COS_ACCESS_KEY_ID", "IBM_COS_SECRET_ACCESS_KEY"}, // backingstores and namespacestores
-		"google-cloud-storage": {"GoogleServiceAccountPrivateKeyJson"},                 // backingstores and namespacestores
-		"azure-blob":           {"AccountName", "AccountKey"},                          // backingstores and namespacestores
-		"pv-pool":              {},                                                     // backingstores
-		"nsfs":                 {},                                                     // namespacestores
+		"aws-s3":               {"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"},              // backingstores and namespacestores
+		"s3-compatible":        {"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"},              // backingstores and namespacestores
+		"ibm-cos":              {"IBM_COS_ACCESS_KEY_ID", "IBM_COS_SECRET_ACCESS_KEY"},      // backingstores and namespacestores
+		"google-cloud-storage": {GoogleCredentialsJson, GoogleServiceAccountPrivateKeyJson}, // backingstores and namespacestores
+		"azure-blob":           {"AccountName", "AccountKey"},                               // backingstores and namespacestores
+		"pv-pool":              {},                                                          // backingstores
+		"nsfs":                 {},                                                          // namespacestores
 	}
 )
 
@@ -902,6 +948,20 @@ func InitLogger(lvl logrus.Level) {
 	})
 }
 
+// OperatorLogLevel maps a string log level name to a logrus.Level.
+// Accepted values: "warn", "info", "debug".
+// Any unrecognized value defaults to InfoLevel.
+func OperatorLogLevel(level string) logrus.Level {
+	switch level {
+	case "warn":
+		return logrus.WarnLevel
+	case "debug":
+		return logrus.DebugLevel
+	default:
+		return logrus.InfoLevel
+	}
+}
+
 // Logger returns a default logger
 func Logger() *logrus.Entry {
 	return log
@@ -1105,36 +1165,54 @@ func SetErrorCondition(conditions *[]conditionsv1.Condition, reason string, mess
 	})
 }
 
+var (
+	awsPlatformOnce         sync.Once
+	awsPlatform             bool
+	azurePlatformNonGovOnce sync.Once
+	azurePlatformNonGov     bool
+	gcpPlatformOnce         sync.Once
+	gcpPlatform             bool
+	ibmPlatformOnce         sync.Once
+	ibmPlatform             bool
+	fusionHCIWithScaleOnce  sync.Once
+	fusionHCIWithScale      bool
+)
+
 // IsAWSPlatform returns true if this cluster is running on AWS
 func IsAWSPlatform() bool {
-	nodesList := &corev1.NodeList{}
-	if ok := KubeList(nodesList); !ok || len(nodesList.Items) == 0 {
-		Panic(fmt.Errorf("failed to list kubernetes nodes"))
-	}
-	isAWS := strings.HasPrefix(nodesList.Items[0].Spec.ProviderID, "aws")
-	return isAWS
+	awsPlatformOnce.Do(func() {
+		nodesList := &corev1.NodeList{}
+		if ok := KubeList(nodesList); !ok || len(nodesList.Items) == 0 {
+			Panic(fmt.Errorf("failed to list kubernetes nodes"))
+		}
+		awsPlatform = strings.HasPrefix(nodesList.Items[0].Spec.ProviderID, "aws")
+	})
+	return awsPlatform
 }
 
 // IsFusionHCIWithScale checks if the noobaa is deployed on HCI platform and
 // using Spectrum Scale storage.
 func IsFusionHCIWithScale() bool {
-	sc := &storagev1.StorageClass{
-		TypeMeta:   metav1.TypeMeta{Kind: "StorageClass"},
-		ObjectMeta: metav1.ObjectMeta{Name: "ibm-spectrum-scale-csi-storageclass-version2"},
-	}
-	return KubeCheck(sc)
+	fusionHCIWithScaleOnce.Do(func() {
+		sc := &storagev1.StorageClass{
+			TypeMeta:   metav1.TypeMeta{Kind: "StorageClass"},
+			ObjectMeta: metav1.ObjectMeta{Name: "ibm-spectrum-scale-csi-storageclass-version2"},
+		}
+		fusionHCIWithScale = KubeCheckQuiet(sc)
+	})
+	return fusionHCIWithScale
 }
 
-// IsSTSClusterBS returns true if it is running on an STS cluster
-func IsSTSClusterBS(bs *nbv1.BackingStore) bool {
+// IsAWSSTSClusterBS returns true if it is running on an STS cluster
+func IsAWSSTSClusterBS(bs *nbv1.BackingStore) bool {
 	if bs.Spec.Type == nbv1.StoreTypeAWSS3 {
 		return bs.Spec.AWSS3.AWSSTSRoleARN != nil
 	}
 	return false
 }
 
-// IsSTSClusterNS returns true if the namespace store uses AWS STS (short-lived credentials). For Azure STS use IsAzureSTSClusterNS().
-func IsSTSClusterNS(ns *nbv1.NamespaceStore) bool {
+// IsAWSSTSClusterNS returns true if the namespace store uses AWS STS (short-lived credentials). For Azure STS use IsAzureSTSClusterNS().
+func IsAWSSTSClusterNS(ns *nbv1.NamespaceStore) bool {
 	if ns.Spec.Type == nbv1.NSStoreTypeAWSS3 {
 		return ns.Spec.AWSS3.AWSSTSRoleARN != nil
 	}
@@ -1157,52 +1235,356 @@ func IsAzureSTSClusterNS(ns *nbv1.NamespaceStore) bool {
 	return false
 }
 
-// IsAzurePlatformNonGovernment returns true if this cluster is running on Azure and also not on azure government\DOD cloud
-func IsAzurePlatformNonGovernment() bool {
-	nodesList := &corev1.NodeList{}
-	if ok := KubeList(nodesList); !ok || len(nodesList.Items) == 0 {
-		Panic(fmt.Errorf("failed to list kubernetes nodes"))
+// isGoogleSTSClusterStore is a helper function that checks if a store uses GCP WIF (STS) (short-lived credentials).
+func isGoogleSTSClusterStore(isGoogleCloudStorage bool, secretRef *corev1.SecretReference, err error) bool {
+	if !isGoogleCloudStorage {
+		return false
 	}
-	const regionLabel string = "topology.kubernetes.io/region"
-	node := nodesList.Items[0]
-	isAzure := strings.HasPrefix(node.Spec.ProviderID, "azure")
-	if isAzure {
-		nodeLabels := node.GetLabels()
-		region, ok := nodeLabels[regionLabel]
-		if !ok {
-			log.Warnf("did not find the expected label %q on node %q to determine azure region", regionLabel, node.Name)
-		} else if strings.HasPrefix(region, "usgov") || strings.HasPrefix(region, "usdod") {
-			log.Infof("identified the region [%q] as an Azure gov/DOD region", region)
-			return false
+	if err != nil || secretRef == nil || secretRef.Name == "" {
+		return false
+	}
+	secret, err := GetSecretFromSecretReference(secretRef)
+	if err != nil {
+		return false
+	}
+	return isGoogleSTSSecret(secret)
+}
+
+// IsGoogleSTSClusterBS returns true if the backing store uses GCP WIF (STS) (short-lived credentials).
+func IsGoogleSTSClusterBS(bs *nbv1.BackingStore) bool {
+	isGoogleCloudStorage := bs.Spec.Type == nbv1.StoreTypeGoogleCloudStorage && bs.Spec.GoogleCloudStorage != nil
+	secretRef, err := GetBackingStoreSecret(bs)
+	return isGoogleSTSClusterStore(isGoogleCloudStorage, secretRef, err)
+}
+
+// IsGoogleSTSClusterNS returns true if the namespace store uses GCP WIF (STS) (short-lived credentials).
+func IsGoogleSTSClusterNS(ns *nbv1.NamespaceStore) bool {
+	isGoogleCloudStorage := ns.Spec.Type == nbv1.NSStoreTypeGoogleCloudStorage && ns.Spec.GoogleCloudStorage != nil
+	secretRef, err := GetNamespaceStoreSecret(ns)
+	return isGoogleSTSClusterStore(isGoogleCloudStorage, secretRef, err)
+}
+
+// isGoogleSTSSecret returns true if the secret contains a GCP WIF (STS) (short-lived credentials).
+func isGoogleSTSSecret(secret *corev1.Secret) bool {
+	if secret == nil {
+		return false
+	}
+	if wifJSON := secretDataString(secret, GoogleCredentialsJson); wifJSON != "" {
+		isExternalAccount, _, err := ParseGoogleCredentials(wifJSON)
+		if err == nil && isExternalAccount {
+			return true
 		}
 	}
-	return isAzure
+	if keyJSON := secretDataString(secret, GoogleServiceAccountPrivateKeyJson); keyJSON != "" {
+		isExternalAccount, _, err := ParseGoogleCredentials(keyJSON)
+		if err == nil && isExternalAccount {
+			return true
+		}
+	}
+	return false
+}
+
+// ParseGoogleCredentials parses credential JSON and returns whether it is GCP WIF (STS) and the identity
+func ParseGoogleCredentials(credentialsJSON string) (bool, string, error) {
+	creds := &googleCredentialsJSON{}
+	if err := json.Unmarshal([]byte(credentialsJSON), creds); err != nil {
+		return false, "", fmt.Errorf("invalid google credentials json: %w", err)
+	}
+	identity, err := googleIdentityFromCredentials(creds)
+	if err != nil {
+		return false, "", err
+	}
+	return creds.Type == "external_account", identity, nil
+}
+
+// GoogleCredentialsFromStoreSecret returns GCP credentials JSON from a backing store or namespace store secret.
+// Exactly one of GoogleCredentialsJson (WIF) or GoogleServiceAccountPrivateKeyJson (classic) must be set.
+func GoogleCredentialsFromStoreSecret(secret *corev1.Secret) (string, error) {
+	if secret == nil {
+		return "", ValidationError{Msg: "invalid google secret: secret is nil"}
+	}
+	wifJSON := secretDataString(secret, GoogleCredentialsJson)
+	serviceAccountJSON := secretDataString(secret, GoogleServiceAccountPrivateKeyJson)
+	if wifJSON != "" && serviceAccountJSON != "" {
+		return "", ValidationError{Msg: fmt.Sprintf(
+			"secret %q in namespace %q must not contain both %q and %q; use %q for GCP WIF (STS) external_account or %q for service_account",
+			secret.Name, secret.Namespace, GoogleCredentialsJson, GoogleServiceAccountPrivateKeyJson,
+			GoogleCredentialsJson, GoogleServiceAccountPrivateKeyJson,
+		)}
+	}
+	if wifJSON != "" {
+		return wifJSON, nil
+	}
+	if serviceAccountJSON != "" {
+		return serviceAccountJSON, nil
+	}
+	return "", ValidationError{Msg: fmt.Sprintf(
+		"Invalid secret for google type %q in namespace %q expected JSON in data.GoogleCredentialsJson or data.GoogleServiceAccountPrivateKeyJson",
+		secret.Name, secret.Namespace,
+	)}
+}
+
+// googleIdentityFromCredentials returns the identity.
+// - For GCP (service_account type in JSON) - it uses private_key_id
+// - For GCP STS (external_account type in JSON) it uses the email from service_account_impersonation_url.
+// Unknown or missing type fails immediately.
+func googleIdentityFromCredentials(creds *googleCredentialsJSON) (string, error) {
+	switch creds.Type {
+	case "external_account":
+		return googleIdentityFromImpersonationURL(creds.ServiceAccountImpersonationURL)
+	case "service_account":
+		if creds.PrivateKeyID == "" {
+			return "", fmt.Errorf("invalid google service account json: missing private_key_id")
+		}
+		return creds.PrivateKeyID, nil
+	case "":
+		return "", fmt.Errorf("invalid google credentials json: missing type")
+	default:
+		return "", fmt.Errorf("invalid google credentials json: unsupported type %q", creds.Type)
+	}
+}
+
+// googleIdentityFromImpersonationURL returns the email from the impersonation URL
+func googleIdentityFromImpersonationURL(impersonationURL string) (string, error) {
+	if !strings.HasPrefix(impersonationURL, GoogleImpersonationURLPrefix) ||
+		!strings.HasSuffix(impersonationURL, GoogleImpersonationURLSuffix) {
+		return "", fmt.Errorf("invalid service_account_impersonation_url: %q", impersonationURL)
+	}
+	email := strings.TrimSuffix(
+		strings.TrimPrefix(impersonationURL, GoogleImpersonationURLPrefix),
+		GoogleImpersonationURLSuffix,
+	)
+	if email == "" {
+		return "", fmt.Errorf("invalid service_account_impersonation_url: empty service account email in %q", impersonationURL)
+	}
+	if !strings.Contains(email, "@") {
+		return "", fmt.Errorf("invalid service_account_impersonation_url: malformed service account email %q in %q", email, impersonationURL)
+	}
+	return email, nil
+}
+
+// GoogleWIFAudience returns the WIF audience URL for the given pool and provider for GCP WIF (STS)..
+func GoogleWIFAudience(projectNumber, poolID, providerID string) string {
+	return fmt.Sprintf("//iam.googleapis.com/projects/%s/locations/global/workloadIdentityPools/%s/providers/%s",
+		projectNumber, poolID, providerID)
+}
+
+// BuildGoogleWIFCredentialsJSON builds external_account credentials JSON for GCP WIF (STS).
+func BuildGoogleWIFCredentialsJSON(projectNumber, poolID, providerID, serviceAccountEmail string) (string, error) {
+	projectNumber = strings.TrimSpace(projectNumber)
+	poolID = strings.TrimSpace(poolID)
+	providerID = strings.TrimSpace(providerID)
+	serviceAccountEmail = strings.TrimSpace(serviceAccountEmail)
+
+	if err := ValidateGCPWIFParamFormats(projectNumber, poolID, providerID, serviceAccountEmail); err != nil {
+		return "", err
+	}
+
+	googleExternalAccountCredentialType := "external_account"
+	audience := GoogleWIFAudience(projectNumber, poolID, providerID)
+
+	credentials := googleCredentialsJSONFullSTS{
+		Type:                           googleExternalAccountCredentialType,
+		Audience:                       audience,
+		SubjectTokenType:               "urn:ietf:params:oauth:token-type:jwt",
+		TokenURL:                       "https://sts.googleapis.com/v1/token",
+		ServiceAccountImpersonationURL: GoogleImpersonationURLPrefix + serviceAccountEmail + GoogleImpersonationURLSuffix,
+		CredentialSource: googleWIFCredentialSource{
+			File:   WebIdentityTokenPath,
+			Format: map[string]string{"type": "text"},
+		},
+	}
+
+	credentialsBytes, err := json.Marshal(credentials)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal credentials: %w", err)
+	}
+
+	return string(credentialsBytes), nil
+}
+
+// GcpProjectIDFromServiceAccountEmail returns the GCP project ID from a service account email
+// the format is: SERVICE_ACCOUNT_NAME@PROJECT_ID.iam.gserviceaccount.com
+// (e.g. "noobaa-wif-sa@my-project.iam.gserviceaccount.com" -> "my-project").
+func GcpProjectIDFromServiceAccountEmail(email string) (string, error) {
+	at := strings.LastIndex(email, "@")
+	if at < 0 {
+		return "", fmt.Errorf("invalid GCP service account email %q", email)
+	}
+	projectID := strings.TrimSuffix(email[at+1:], gcpServiceAccountEmailSuffix)
+	if projectID == "" {
+		return "", fmt.Errorf("invalid GCP service account email %q", email)
+	}
+	return projectID, nil
+}
+
+// ValidateGCPProjectNumber validates a GCP project number (numeric string, not project ID).
+func ValidateGCPProjectNumber(projectNumber, fieldName string) error {
+	projectNumber = strings.TrimSpace(projectNumber)
+	if projectNumber == "" {
+		return ValidationError{Msg: fmt.Sprintf("%s is required and must be non-empty", fieldName)}
+	}
+	if !gcpProjectNumberRegexp.MatchString(projectNumber) {
+		return ValidationError{Msg: fmt.Sprintf("%s must be a numeric GCP project number (digits only), not a project ID", fieldName)}
+	}
+	return nil
+}
+
+// ValidateGCPWIFPoolOrProviderID validates a GCP workload identity pool ID or provider ID
+func ValidateGCPWIFPoolOrProviderID(resourceID, fieldName string) error {
+	const (
+		minLen           = 4
+		maxLen           = 32
+		reservedIDPrefix = "gcp-"
+	)
+
+	resourceID = strings.TrimSpace(resourceID)
+	if resourceID == "" {
+		return ValidationError{Msg: fmt.Sprintf("%s is required and must be non-empty", fieldName)}
+	}
+	if len(resourceID) < minLen || len(resourceID) > maxLen {
+		return ValidationError{Msg: fmt.Sprintf("%s must be %d-%d characters", fieldName, minLen, maxLen)}
+	}
+	if strings.HasPrefix(resourceID, reservedIDPrefix) {
+		return ValidationError{Msg: fmt.Sprintf("%s must not start with %q (reserved by Google)", fieldName, reservedIDPrefix)}
+	}
+	if !gcpWIFPoolOrProviderIDRegexp.MatchString(resourceID) {
+		return ValidationError{Msg: fmt.Sprintf("%s must contain only lowercase letters, digits, and hyphens [a-z0-9-]", fieldName)}
+	}
+	return nil
+}
+
+// ValidateGCPServiceAccountEmail validates a user-managed GCP service account.
+func ValidateGCPServiceAccountEmail(email, fieldName string) error {
+	const (
+		accountIDMinLen = 6
+		accountIDMaxLen = 30
+	)
+
+	email = strings.TrimSpace(email)
+	if email == "" {
+		return ValidationError{Msg: fmt.Sprintf("%s is required and must be non-empty", fieldName)}
+	}
+	if !strings.HasSuffix(email, gcpServiceAccountEmailSuffix) {
+		return ValidationError{Msg: fmt.Sprintf("%s must end with %q", fieldName, gcpServiceAccountEmailSuffix)}
+	}
+	if strings.Count(email, "@") != 1 {
+		return ValidationError{Msg: fmt.Sprintf("%s must be a valid GCP service account email (exactly one @)", fieldName)}
+	}
+
+	serviceAccountID, domain, ok := strings.Cut(email, "@")
+	if !ok || serviceAccountID == "" {
+		return ValidationError{Msg: fmt.Sprintf("%s must be a valid GCP service account email (missing service account ID)", fieldName)}
+	}
+	if strings.TrimSuffix(domain, gcpServiceAccountEmailSuffix) == "" {
+		return ValidationError{Msg: fmt.Sprintf("%s must be a valid GCP service account email (missing project ID)", fieldName)}
+	}
+	if len(serviceAccountID) < accountIDMinLen || len(serviceAccountID) > accountIDMaxLen {
+		return ValidationError{Msg: fmt.Sprintf("%s account ID must be %d-%d characters", fieldName, accountIDMinLen, accountIDMaxLen)}
+	}
+	if !gcpServiceAccountIDRegexp.MatchString(serviceAccountID) {
+		return ValidationError{Msg: fmt.Sprintf("%s must be a valid GCP service account email (account ID: lowercase letters, digits, hyphens)", fieldName)}
+	}
+	return nil
+}
+
+// ValidateGCPWIFParamFormats validates GCP WIF (STS) parameter formats.
+// All four parameters must be non-empty before calling this function.
+func ValidateGCPWIFParamFormats(projectNumber, poolID, providerID, serviceAccountEmail string) error {
+	if err := ValidateGCPProjectNumber(projectNumber, "project-number"); err != nil {
+		return err
+	}
+	if err := ValidateGCPWIFPoolOrProviderID(poolID, "pool-id"); err != nil {
+		return err
+	}
+	if err := ValidateGCPWIFPoolOrProviderID(providerID, "provider-id"); err != nil {
+		return err
+	}
+	if err := ValidateGCPServiceAccountEmail(serviceAccountEmail, "service-account-email"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ValidateGCPWIFParams validates completeness and format of GCP WIF (STS) parameters.
+// If any parameter is set, all four must be set and valid. If none are set, validation passes.
+func ValidateGCPWIFParams(projectNumber, poolID, providerID, serviceAccountEmail string) error {
+	count := 0
+	if projectNumber != "" {
+		count++
+	}
+	if poolID != "" {
+		count++
+	}
+	if providerID != "" {
+		count++
+	}
+	if serviceAccountEmail != "" {
+		count++
+	}
+	if count == 0 {
+		return nil
+	}
+	if count != 4 {
+		return ValidationError{Msg: "when any GCP WIF (STS) parameter is set, all four are required: project-number, pool-id, provider-id, service-account-email"}
+	}
+	return ValidateGCPWIFParamFormats(projectNumber, poolID, providerID, serviceAccountEmail)
+}
+
+// IsAzurePlatformNonGovernment returns true if this cluster is running on Azure and also not on azure government\DOD cloud
+func IsAzurePlatformNonGovernment() bool {
+	azurePlatformNonGovOnce.Do(func() {
+		nodesList := &corev1.NodeList{}
+		if ok := KubeList(nodesList); !ok || len(nodesList.Items) == 0 {
+			Panic(fmt.Errorf("failed to list kubernetes nodes"))
+		}
+		const regionLabel string = "topology.kubernetes.io/region"
+		node := nodesList.Items[0]
+		isAzure := strings.HasPrefix(node.Spec.ProviderID, "azure")
+		if isAzure {
+			nodeLabels := node.GetLabels()
+			region, ok := nodeLabels[regionLabel]
+			if !ok {
+				log.Warnf("did not find the expected label %q on node %q to determine azure region", regionLabel, node.Name)
+			} else if strings.HasPrefix(region, "usgov") || strings.HasPrefix(region, "usdod") {
+				log.Infof("identified the region [%q] as an Azure gov/DOD region", region)
+				isAzure = false
+			}
+		}
+		azurePlatformNonGov = isAzure
+	})
+	return azurePlatformNonGov
 }
 
 // IsGCPPlatform returns true if this cluster is running on GCP
 func IsGCPPlatform() bool {
-	nodesList := &corev1.NodeList{}
-	if ok := KubeList(nodesList); !ok || len(nodesList.Items) == 0 {
-		Panic(fmt.Errorf("failed to list kubernetes nodes"))
-	}
-	isGCP := strings.HasPrefix(nodesList.Items[0].Spec.ProviderID, "gce")
-	return isGCP
+	gcpPlatformOnce.Do(func() {
+		nodesList := &corev1.NodeList{}
+		if ok := KubeList(nodesList); !ok || len(nodesList.Items) == 0 {
+			Panic(fmt.Errorf("failed to list kubernetes nodes"))
+		}
+		gcpPlatform = strings.HasPrefix(nodesList.Items[0].Spec.ProviderID, "gce")
+	})
+	return gcpPlatform
 }
 
 // IsIBMPlatform returns true if this cluster is running on IBM Cloud
 func IsIBMPlatform() bool {
-	nodesList := &corev1.NodeList{}
-	if ok := KubeList(nodesList); !ok || len(nodesList.Items) == 0 {
-		Panic(fmt.Errorf("failed to list kubernetes nodes"))
-	}
-	isIBM := strings.HasPrefix(nodesList.Items[0].Spec.ProviderID, "ibm")
-	if isIBM {
-		// In case of Satellite cluster is deployed in user provided infrastructure
-		if strings.Contains(nodesList.Items[0].Spec.ProviderID, "/sat-") {
-			isIBM = false
+	ibmPlatformOnce.Do(func() {
+		nodesList := &corev1.NodeList{}
+		if ok := KubeList(nodesList); !ok || len(nodesList.Items) == 0 {
+			Panic(fmt.Errorf("failed to list kubernetes nodes"))
 		}
-	}
-	return isIBM
+		isIBM := strings.HasPrefix(nodesList.Items[0].Spec.ProviderID, "ibm")
+		if isIBM {
+			// In case of Satellite cluster is deployed in user provided infrastructure
+			if strings.Contains(nodesList.Items[0].Spec.ProviderID, "/sat-") {
+				isIBM = false
+			}
+		}
+		ibmPlatform = isIBM
+	})
+	return ibmPlatform
 }
 
 // GetIBMRegion returns the cluster's region in IBM Cloud
@@ -1302,6 +1684,11 @@ func GetAWSRegion() (string, error) {
 		return "", fmt.Errorf("Failed to determine the AWS region")
 	}
 	return awsRegion, nil
+}
+
+// IsArchiveNamespaceStore returns true when the store is configured for archive (cold storage) use.
+func IsArchiveNamespaceStore(ns *nbv1.NamespaceStore) bool {
+	return ns != nil && ns.Spec.Archive
 }
 
 // IsValidS3BucketName checks the name according to
@@ -1452,6 +1839,40 @@ func IsStringGraphicOrSpacesCharsOnly(s string) bool {
 	return true
 }
 
+// ValidateGoogleCredentialsJSONType checks that credentials JSON is valid and matches
+// the expected type: service_account for long-lived creds, external_account for GCP WIF (STS).
+func ValidateGoogleCredentialsJSONType(credentialsJSON string, expectedSTS bool) error {
+	isSTS, _, err := ParseGoogleCredentials(credentialsJSON)
+	if err != nil {
+		return err
+	}
+	if expectedSTS && !isSTS {
+		return ValidationError{Msg: fmt.Sprintf("GCP credentials JSON type must be %q for WIF (STS)", "external_account")}
+	}
+	if !expectedSTS && isSTS {
+		return ValidationError{Msg: fmt.Sprintf("GCP credentials JSON type must be %q for long-lived credentials", "service_account")}
+	}
+	return nil
+}
+
+// VerifyGoogleCredentialsJSONTypeInSecret validates credential JSON type in an existing secret.
+// Call VerifyCredsInSecret first for existence and mandatory key checks.
+func VerifyGoogleCredentialsJSONTypeInSecret(secretName, namespace string, expectSTS bool) {
+	secret := KubeObject(bundle.File_deploy_internal_secret_empty_yaml).(*corev1.Secret)
+	secret.Name = secretName
+	secret.Namespace = namespace
+	if !KubeCheck(secret) {
+		log.Fatalf("secret %q does not exist", secretName)
+	}
+	credentialsJSON, err := GoogleCredentialsFromStoreSecret(secret)
+	if err != nil {
+		log.Fatalf("❌ secret %q: %v", secret.Name, err)
+	}
+	if err := ValidateGoogleCredentialsJSONType(credentialsJSON, expectSTS); err != nil {
+		log.Fatalf("❌ secret %q: %v", secret.Name, err)
+	}
+}
+
 // VerifyCredsInSecret throws fatal error when a given secret doesn't contain the mandatory properties
 func VerifyCredsInSecret(secretName string, namespace string, mandatoryProperties []string) {
 	secret := KubeObject(bundle.File_deploy_internal_secret_empty_yaml).(*corev1.Secret)
@@ -1598,17 +2019,6 @@ func GetAnnotationValue(annotations map[string]string, name string) (string, boo
 		return val, exists
 	}
 	return "", false
-}
-
-// IsRemoteClientNoobaa checks for the existance and value of the remote-client-noobaa annotation
-// within an annotation map, if the annotation doesnt exist it's the same as if its value is false.
-func IsRemoteClientNoobaa(annotations map[string]string) bool {
-	annotationValue, exists := GetAnnotationValue(annotations, "remote-client-noobaa")
-	annotationBoolVal := false
-	if exists {
-		annotationBoolVal = strings.ToLower(annotationValue) == trueStr
-	}
-	return annotationBoolVal
 }
 
 // IsRemoteObcAnnotation checks for the existance and value of the remote-obc-creation annotation
@@ -2197,7 +2607,11 @@ func CheckForIdenticalSecretsCreds(secret *corev1.Secret, storeTypeStr string) *
 				if usedSecret != nil && usedSecret.Name != secret.Name && string(bs.Spec.Type) == storeTypeStr {
 					found := true
 					for _, key := range mandatoryProp {
-						found = found && MapAlternateKeysValue(usedSecret.StringData, key) == MapAlternateKeysValue(secret.StringData, key)
+						usedValue := MapAlternateKeysValue(usedSecret.StringData, key)
+						secretValue := MapAlternateKeysValue(secret.StringData, key)
+						if usedValue != "" || secretValue != "" {
+							found = found && usedValue == secretValue
+						}
 					}
 					if found {
 						return usedSecret
@@ -2221,7 +2635,11 @@ func CheckForIdenticalSecretsCreds(secret *corev1.Secret, storeTypeStr string) *
 				if usedSecret != nil && usedSecret.Name != secret.Name && string(ns.Spec.Type) == storeTypeStr {
 					found := true
 					for _, key := range mandatoryProp {
-						found = found && MapAlternateKeysValue(usedSecret.StringData, key) == MapAlternateKeysValue(secret.StringData, key)
+						usedValue := MapAlternateKeysValue(usedSecret.StringData, key)
+						secretValue := MapAlternateKeysValue(secret.StringData, key)
+						if usedValue != "" || secretValue != "" {
+							found = found && usedValue == secretValue
+						}
 					}
 					if found {
 						return usedSecret
@@ -2458,4 +2876,19 @@ func OnSignal(cb func(), signals ...os.Signal) {
 	<-signalChan
 
 	cb()
+}
+
+// secretDataString returns a secret data value by key from StringData or Data.
+// Kubernetes API reads populate Data only; callers that use KubeCheck also populate StringData.
+func secretDataString(secret *corev1.Secret, key string) string {
+	if secret == nil {
+		return ""
+	}
+	if v := secret.StringData[key]; v != "" {
+		return v
+	}
+	if v, ok := secret.Data[key]; ok {
+		return string(v)
+	}
+	return ""
 }

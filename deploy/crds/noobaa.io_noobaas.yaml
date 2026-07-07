@@ -1153,8 +1153,11 @@ spec:
                   db container
                 type: string
               dbPriorityClassName:
-                description: DBPriorityClassName (optional) overrides the priority
-                  class for the db pod
+                description: |-
+                  DBPriorityClassName (optional) overrides the priority class for the db pod.
+                  Takes effect on next pod restart (e.g. upgrade, node drain, crash); does not trigger a rolling restart of CNPG-managed pods.
+                  To apply immediately, restart the DB pods manually after reviewing CNPG documentation.
+                  https://cloudnative-pg.io/docs
                 type: string
               dbResources:
                 description: DBResources (optional) overrides the default resource
@@ -1495,8 +1498,9 @@ spec:
                     properties:
                       secret:
                         description: |-
-                          Secret refers to a secret that provides the credentials
-                          The secret should define GoogleServiceAccountPrivateKeyJson containing the entire json string as provided by Google.
+                          Secret refers to a secret that provides the credentials.
+                          For classic google-cloud-storage, define GoogleServiceAccountPrivateKeyJson (service_account JSON).
+                          For GCP WIF (STS), define GoogleCredentialsJson (external_account JSON).
                         properties:
                           name:
                             description: name is unique within a namespace to reference
@@ -1935,6 +1939,18 @@ spec:
                   update the admin account with new BackingStore/NamespaceStore in order to delete the DefaultBackingStore/DefaultNamespaceStore
                 nullable: true
                 type: boolean
+              performanceProfile:
+                description: |-
+                  PerformanceProfile (optional) selects a bundle of resource and count
+                  settings for the core, db and endpoint components.
+                  Explicit per-component resource/count fields take precedence over the profile.
+                enum:
+                - default
+                - mixed-workload
+                - small-objects
+                - dev-env
+                - mini-env
+                type: string
               pvPoolDefaultStorageClass:
                 description: |-
                   PVPoolDefaultStorageClass (optional) overrides the default cluster StorageClass for the pv-pool volumes.
@@ -2016,9 +2032,10 @@ spec:
                     operator:
                       description: |-
                         Operator represents a key's relationship to the value.
-                        Valid operators are Exists and Equal. Defaults to Equal.
+                        Valid operators are Exists, Equal, Lt, and Gt. Defaults to Equal.
                         Exists is equivalent to wildcard for value, so that a pod can
                         tolerate all taints of a particular category.
+                        Lt and Gt perform numeric comparisons (requires feature gate TaintTolerationComparisonOperators).
                       type: string
                     tolerationSeconds:
                       description: |-

@@ -41,10 +41,16 @@ const (
 	falseStr                string = "false"
 	notificationsVolume     string = "notif-vol"
 	postgresSecretMountPath string = "/etc/postgres-secret"
-	clientIDEnvVar          string = "ClientId"
-	tenantIDEnvVar          string = "TenantId"
-	subscriptionIDEnvVar    string = "SubscriptionId"
-	resourcegroupIDEnvVar   string = "ResourcegroupId"
+	clientIDEnvVar          string = "CLIENTID"
+	tenantIDEnvVar          string = "TENANTID"
+	subscriptionIDEnvVar    string = "SUBSCRIPTIONID"
+	resourcegroupIDEnvVar   string = "RESOURCEGROUP"
+	azureRegionEnvVar       string = "AZUREREGION"
+	// GCP WIF (STS)
+	gcpProjectNumberEnvVar       string = "PROJECT_NUMBER"
+	gcpPoolIdEnvVar              string = "POOL_ID"
+	gcpProviderIdEnvVar          string = "PROVIDER_ID"
+	gcpServiceAccountEmailEnvVar string = "SERVICE_ACCOUNT_EMAIL"
 )
 
 // ReconcilePhaseCreating runs the reconcile phase
@@ -132,11 +138,10 @@ func (r *Reconciler) ReconcilePhaseCreatingForMainClusters() error {
 		return err
 	}
 
-	if r.CoreAppConfig.Data["NOOBAA_LOG_LEVEL"] == "warn" {
-		r.Logger.Infof("Setting operator log level to Warn")
-		util.InitLogger(logrus.WarnLevel)
-	} else {
-		util.InitLogger(logrus.DebugLevel)
+	newLevel := util.OperatorLogLevel(r.CoreAppConfig.Data["OPERATOR_LOG_LEVEL"])
+	if logrus.GetLevel() != newLevel {
+		r.Logger.Warnf("Setting operator log level to %s", newLevel)
+		util.InitLogger(newLevel)
 	}
 
 	// A failure to discover OAuth endpoints should not fail the entire reconcile phase.
@@ -467,7 +472,7 @@ func (r *Reconciler) SetDesiredNooBaaDB() error {
 					if desiredClass != currentClass {
 						r.Logger.Infof("No match between desired DB storage class in noobaa %s and current class in pvc %s",
 							desiredClass, currentClass)
-						r.Recorder.Eventf(r.NooBaa, corev1.EventTypeWarning, "DBStorageClassIsImmutable",
+						r.Recorder.Eventf(r.NooBaa, nil, corev1.EventTypeWarning, "DBStorageClassIsImmutable", "DBStorageClassIsImmutable",
 							"spec.dbStorageClass is immutable and cannot be updated for volume %q in existing %s %q"+
 								" since it requires volume recreate and migrate which is unsupported by the operator",
 							pvc.Name, r.CoreApp.Kind, r.CoreApp.Name)
@@ -476,7 +481,7 @@ func (r *Reconciler) SetDesiredNooBaaDB() error {
 				if r.NooBaa.Spec.DBVolumeResources != nil &&
 					!reflect.DeepEqual(pvc.Spec.Resources, *r.NooBaa.Spec.DBVolumeResources) {
 					r.Logger.Infof("No match between DB volume resources")
-					r.Recorder.Eventf(r.NooBaa, corev1.EventTypeWarning, "DBVolumeResourcesIsImmutable",
+					r.Recorder.Eventf(r.NooBaa, nil, corev1.EventTypeWarning, "DBVolumeResourcesIsImmutable", "DBVolumeResourcesIsImmutable",
 						"spec.dbVolumeResources is immutable and cannot be updated for volume %q in existing %s %q"+
 							" since it requires volume recreate and migrate which is unsupported by the operator",
 						pvc.Name, r.CoreApp.Kind, r.CoreApp.Name)
@@ -512,8 +517,9 @@ func (r *Reconciler) setDesiredCoreEnv(c *corev1.Container) {
 		case "POSTGRES_HOST":
 			if r.shouldReconcileStandaloneDB() {
 				c.Env[j].Value = r.NooBaaPostgresDB.Name + "-0." + r.NooBaaPostgresDB.Spec.ServiceName + "." + r.NooBaaPostgresDB.Namespace + ".svc"
-			} else if r.shouldReconcileCNPGCluster() {
-				// clear env. it will be passed by mounting the secret
+			} else {
+				// CNPG and external-pg both ship the host via mounted secret;
+				// clear the default so noobaa-core reads POSTGRES_HOST_PATH
 				c.Env[j].Value = ""
 				c.Env[j].ValueFrom = nil
 			}
@@ -623,6 +629,7 @@ func (r *Reconciler) setDesiredCoreEnv(c *corev1.Container) {
 		util.MergeEnvArrays(&c.Env, &[]corev1.EnvVar{envVar})
 	}
 
+	util.ApplyTLSEnvVars(&c.Env, r.NooBaa.Spec.Security.APIServerSecurity)
 }
 
 // SetDesiredCoreApp updates the CoreApp as desired for reconciling
@@ -690,9 +697,7 @@ func (r *Reconciler) SetDesiredCoreApp() error {
 			util.ReflectEnvVariable(&c.Env, "HTTPS_PROXY")
 			util.ReflectEnvVariable(&c.Env, "NO_PROXY")
 
-			if r.NooBaa.Spec.CoreResources != nil {
-				c.Resources = *r.NooBaa.Spec.CoreResources
-			}
+			c.Resources = getCoreResources(r.NooBaa)
 
 			if r.shouldReconcileCNPGCluster() {
 				dbSecretVolumeMounts := []corev1.VolumeMount{{
@@ -778,8 +783,8 @@ func (r *Reconciler) SetDesiredCoreApp() error {
 				c.Image = r.NooBaa.Status.ActualImage
 			}
 
-			if r.NooBaa.Spec.LogResources != nil {
-				c.Resources = *r.NooBaa.Spec.LogResources
+			if logResources := getLogResources(r.NooBaa); logResources != nil {
+				c.Resources = *logResources
 			} else {
 				var reqCPU, reqMem resource.Quantity
 				reqCPU, _ = resource.ParseQuantity("200m")
@@ -819,15 +824,15 @@ func (r *Reconciler) SetDesiredCoreApp() error {
 	if r.CoreApp.UID == "" {
 		// generate info event for the first creation of noobaa
 		if r.Recorder != nil {
-			r.Recorder.Eventf(r.NooBaa, corev1.EventTypeNormal,
-				"NooBaaImage", `Using NooBaa image %q for the creation of %q`, r.NooBaa.Status.ActualImage, r.NooBaa.Name)
+			r.Recorder.Eventf(r.NooBaa, nil, corev1.EventTypeNormal,
+				"NooBaaImage", "NooBaaImage", `Using NooBaa image %q for the creation of %q`, r.NooBaa.Status.ActualImage, r.NooBaa.Name)
 		}
 	} else {
 		if coreImageChanged {
 			// generate info event for the first creation of noobaa
 			if r.Recorder != nil {
-				r.Recorder.Eventf(r.NooBaa, corev1.EventTypeNormal,
-					"NooBaaImage", `Updating NooBaa image to %q for %q`, r.NooBaa.Status.ActualImage, r.NooBaa.Name)
+				r.Recorder.Eventf(r.NooBaa, nil, corev1.EventTypeNormal,
+					"NooBaaImage", "NooBaaImage", `Updating NooBaa image to %q for %q`, r.NooBaa.Status.ActualImage, r.NooBaa.Name)
 			}
 		}
 
@@ -1087,6 +1092,11 @@ func (r *Reconciler) ReconcileAzureCredentials() error {
 	resourcegroupID := os.Getenv(resourcegroupIDEnvVar)
 	tenantID := os.Getenv(tenantIDEnvVar)
 	subscriptionID := os.Getenv(subscriptionIDEnvVar)
+	azureRegion := os.Getenv(azureRegionEnvVar)
+	// The OCP console does not prompt for a region, and the Azure CCO documentation hardcoded region
+	if azureRegion == "" {
+		azureRegion = "centralus"
+	}
 	r.Logger.Infof("Getting Azure : %s = %s", clientIDEnvVar, clientID)
 
 	r.Logger.Infof("Reconcile Azure STS with clientID: %s ", clientID)
@@ -1130,6 +1140,7 @@ func (r *Reconciler) ReconcileAzureCredentials() error {
 			azureProviderSpec.AzureClientID = clientID
 			azureProviderSpec.AzureTenantID = tenantID
 			azureProviderSpec.AzureSubscriptionID = subscriptionID
+			azureProviderSpec.AzureRegion = azureRegion
 		}
 		updatedProviderSpec, err := codec.EncodeProviderSpec(azureProviderSpec)
 		if err != nil {
@@ -1155,6 +1166,27 @@ func (r *Reconciler) ReconcileAzureCredentials() error {
 
 // ReconcileGCPCredentials creates a CredentialsRequest resource if cloud credentials operator is available
 func (r *Reconciler) ReconcileGCPCredentials() error {
+	// check if we have the envs that indicates that this is an OpenShift GCP WIF (STS) cluster:
+	// PROJECT_NUMBER, POOL_ID, PROVIDER_ID (all 3 of them create the AUDIENCE), and SERVICE_ACCOUNT_EMAIL
+	// cluster admin set this env (either in the UI or via Subscription yaml) and set the mode to manual
+	// olm will then copy the env from the subscription to the operator deployment (which is where your operator can pick it up from)
+	projectNumber := os.Getenv(gcpProjectNumberEnvVar)
+	poolId := os.Getenv(gcpPoolIdEnvVar)
+	providerId := os.Getenv(gcpProviderIdEnvVar)
+	serviceAccountEmail := os.Getenv(gcpServiceAccountEmailEnvVar)
+
+	if projectNumber != "" || poolId != "" || providerId != "" || serviceAccountEmail != "" {
+		r.Logger.Infof("GCP WIF (STS) cluster: %s=%s %s=%s %s=%s %s=%s",
+			gcpProjectNumberEnvVar, projectNumber, gcpPoolIdEnvVar, poolId,
+			gcpProviderIdEnvVar, providerId, gcpServiceAccountEmailEnvVar, serviceAccountEmail,
+		)
+		if err := util.ValidateGCPWIFParams(projectNumber, poolId, providerId, serviceAccountEmail); err != nil {
+			r.Logger.Errorf("Invalid GCP WIF (STS) parameters: %v", err)
+			return fmt.Errorf("invalid GCP WIF (STS) parameters: %w", err)
+		}
+		r.IsGCPSTSCluster = true
+	}
+
 	r.Logger.Info("Running on GCP. will create a CredentialsRequest resource")
 	err := r.Client.Get(r.Ctx, util.ObjectKey(r.GCPCloudCreds), r.GCPCloudCreds)
 	if err == nil || meta.IsNoMatchError(err) || runtime.IsNotRegisteredError(err) {
@@ -1163,6 +1195,24 @@ func (r *Reconciler) ReconcileGCPCredentials() error {
 	if errors.IsNotFound(err) {
 		// credential request does not exist. create one
 		r.Logger.Info("Creating CredentialsRequest resource")
+		if r.IsGCPSTSCluster {
+			codec := cloudcredsv1.Codec
+			gcpProviderSpec := &cloudcredsv1.GCPProviderSpec{}
+			err = codec.DecodeProviderSpec(r.GCPCloudCreds.Spec.ProviderSpec, gcpProviderSpec)
+			if err != nil {
+				r.Logger.Error("error decoding providerSpec from cloud credentials request")
+				return err
+			}
+			gcpProviderSpec.Audience = util.GoogleWIFAudience(projectNumber, poolId, providerId)
+			gcpProviderSpec.ServiceAccountEmail = serviceAccountEmail
+			updatedProviderSpec, err := codec.EncodeProviderSpec(gcpProviderSpec)
+			if err != nil {
+				r.Logger.Error("error encoding providerSpec for cloud credentials request")
+				return err
+			}
+			r.GCPCloudCreds.Spec.ProviderSpec = updatedProviderSpec
+			r.GCPCloudCreds.Spec.CloudTokenPath = r.webIdentityTokenPath
+		}
 		r.Own(r.GCPCloudCreds)
 		err = r.Client.Create(r.Ctx, r.GCPCloudCreds)
 		if err != nil {
@@ -1616,6 +1666,7 @@ func (r *Reconciler) SetDesiredCoreAppConfig() error {
 		"NOOBAA_METRICS_AUTH_ENABLED":  "true",
 		"NOOBAA_VERSION_AUTH_ENABLED":  "true",
 		"ENDPOINT_SYSTEM_STORE_SOURCE": "core", // by default, load the system store in the endpoint from the core instead of the DB
+		"OPERATOR_LOG_LEVEL":           "info",
 	}
 	for key, value := range DefaultConfigMapData {
 		if _, ok := r.CoreAppConfig.Data[key]; !ok {
@@ -1626,7 +1677,16 @@ func (r *Reconciler) SetDesiredCoreAppConfig() error {
 	if r.CoreAppConfig.Annotations == nil {
 		r.CoreAppConfig.Annotations = make(map[string]string)
 	}
-	r.CoreAppConfig.Annotations["noobaa.io/configmap-hash"] = util.GetCmDataHash(r.CoreAppConfig.Data)
+	// Exclude operator-only keys from the hash so that changing them
+	// does not trigger a rolling restart of core/endpoint pods.
+	operatorOnlyKeys := map[string]bool{"OPERATOR_LOG_LEVEL": true}
+	coreData := make(map[string]string, len(r.CoreAppConfig.Data))
+	for k, v := range r.CoreAppConfig.Data {
+		if !operatorOnlyKeys[k] {
+			coreData[k] = v
+		}
+	}
+	r.CoreAppConfig.Annotations["noobaa.io/configmap-hash"] = util.GetCmDataHash(coreData)
 
 	return nil
 }
