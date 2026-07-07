@@ -51,16 +51,21 @@ Once the first reconcile completes and the ConfigMap is read, `OPERATOR_LOG_LEVE
 
 ```bash
 # Quiet the operator (warnings and errors only)
-kubectl patch configmap noobaa-config -n <namespace> \
-  -p '{"data":{"OPERATOR_LOG_LEVEL":"warn"}}'
+nb operator set-log-level warn -n <namespace>
 
 # Verbose debugging
-kubectl patch configmap noobaa-config -n <namespace> \
-  -p '{"data":{"OPERATOR_LOG_LEVEL":"debug"}}'
+nb operator set-log-level debug -n <namespace>
 
 # Back to default
+nb operator set-log-level info -n <namespace>
+```
+
+This updates `OPERATOR_LOG_LEVEL` in the `noobaa-config` ConfigMap. It is the CLI
+equivalent of:
+
+```bash
 kubectl patch configmap noobaa-config -n <namespace> \
-  -p '{"data":{"OPERATOR_LOG_LEVEL":"info"}}'
+  -p '{"data":{"OPERATOR_LOG_LEVEL":"warn"}}'
 ```
 
 The operator picks up the change on the next reconcile cycle (no restart needed).
