@@ -77,15 +77,12 @@ func (r *Reconciler) ReconcilePhaseConfiguring() error {
 	if err := r.reconcileAdmissionTLSConf(); err != nil {
 		return err
 	}
-	// No endpoint creation is required for remote noobaa client
-	if !util.IsRemoteClientNoobaa(r.NooBaa.GetAnnotations()) {
-		util.KubeCreateOptional(util.KubeObject(bundle.File_deploy_scc_endpoint_yaml).(*secv1.SecurityContextConstraints))
-		if err := r.ReconcileObject(r.DeploymentEndpoint, r.SetDesiredDeploymentEndpoint); err != nil {
-			return err
-		}
-		if err := r.ReconcileHPAEndpoint(); err != nil {
-			return err
-		}
+	util.KubeCreateOptional(util.KubeObject(bundle.File_deploy_scc_endpoint_yaml).(*secv1.SecurityContextConstraints))
+	if err := r.ReconcileObject(r.DeploymentEndpoint, r.SetDesiredDeploymentEndpoint); err != nil {
+		return err
+	}
+	if err := r.ReconcileHPAEndpoint(); err != nil {
+		return err
 	}
 
 	if err := r.RegisterToCluster(); err != nil {
@@ -309,12 +306,7 @@ func (r *Reconciler) SetDesiredDeploymentEndpoint() error {
 	}
 
 	if r.DeploymentEndpoint.Spec.Replicas != nil && *r.DeploymentEndpoint.Spec.Replicas == 0 {
-		// replicas can be set to 0 if the cluster went through data import to DB cluster
-		// restore back to the minimum number of replicas
-		minReplicas := int32(1)
-		if endpointsSpec != nil {
-			minReplicas = max(minReplicas, endpointsSpec.MinCount)
-		}
+		minReplicas, _ := r.getEndpointMinMaxCount()
 		r.DeploymentEndpoint.Spec.Replicas = &minReplicas
 	}
 
@@ -364,9 +356,7 @@ func (r *Reconciler) SetDesiredDeploymentEndpoint() error {
 		switch c.Name {
 		case "endpoint":
 			c.Image = r.NooBaa.Status.ActualImage
-			if endpointsSpec != nil && endpointsSpec.Resources != nil {
-				c.Resources = *endpointsSpec.Resources
-			}
+			c.Resources = getEndpointResources(r.NooBaa)
 			mgmtBaseAddr := ""
 			s3BaseAddr := ""
 			syslogBaseAddr := ""
@@ -378,10 +368,6 @@ func (r *Reconciler) SetDesiredDeploymentEndpoint() error {
 				r.setDesiredCoreEnv(c)
 			}
 
-			tlsSec := r.NooBaa.Spec.Security.APIServerSecurity
-			if tlsSec == nil {
-				tlsSec = &nbv1.TLSSecuritySpec{}
-			}
 			for j := range c.Env {
 				switch c.Env[j].Name {
 				case "MGMT_ADDR":
@@ -466,22 +452,10 @@ func (r *Reconciler) SetDesiredDeploymentEndpoint() error {
 					} else {
 						c.Env[j].Value = ""
 					}
-				case "TLS_MIN_VERSION":
-					if tlsSec.TLSMinVersion != nil {
-						c.Env[j].Value = string(*tlsSec.TLSMinVersion)
-					} else {
-						c.Env[j].Value = ""
-					}
-				case "TLS_CIPHERS":
-					c.Env[j].Value = util.MapCiphersToOpenSSL(tlsSec.TLSCiphers)
-				case "TLS_GROUPS":
-					groupNames := make([]string, len(tlsSec.TLSGroups))
-					for i, g := range tlsSec.TLSGroups {
-						groupNames[i] = string(g)
-					}
-					c.Env[j].Value = strings.Join(groupNames, ":")
 				}
 			}
+
+			util.ApplyTLSEnvVars(&c.Env, r.NooBaa.Spec.Security.APIServerSecurity)
 
 			if r.NooBaa.Spec.BucketNotifications.Enabled {
 				envVar := corev1.EnvVar{
@@ -771,6 +745,28 @@ func (r *Reconciler) setDesiredEndpointMounts(podSpec *corev1.PodSpec, container
 		util.MergeVolumeList(&podSpec.Volumes, &externalPgVolumes)
 	}
 
+	// Mount OIDC configuration secret if it exists
+	if util.KubeCheckQuiet(r.SecretOIDCKeyCloakConfig) {
+		optionalTrue := true
+		oidcConfigVolumes := []corev1.Volume{{
+			Name: r.SecretOIDCKeyCloakConfig.Name,
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
+					SecretName: r.SecretOIDCKeyCloakConfig.Name,
+					Optional:   &optionalTrue,
+				},
+			},
+		}}
+		util.MergeVolumeList(&podSpec.Volumes, &oidcConfigVolumes)
+
+		oidcConfigVolumeMounts := []corev1.VolumeMount{{
+			Name:      r.SecretOIDCKeyCloakConfig.Name,
+			MountPath: "/etc/noobaa-server/oidc/keycloak_config",
+			ReadOnly:  true,
+		}}
+		util.MergeVolumeMountList(&container.VolumeMounts, &oidcConfigVolumeMounts)
+	}
+
 	return nil
 }
 
@@ -852,12 +848,7 @@ func (r *Reconciler) ReconcileHPAEndpoint() error {
 
 func (r *Reconciler) updateNoobaaEndpoint() error {
 
-	endpointsSpec := r.NooBaa.Spec.Endpoints
-	var max, min int32 = 1, 2
-	if endpointsSpec != nil {
-		min = endpointsSpec.MinCount
-		max = endpointsSpec.MaxCount
-	}
+	min, max := r.getEndpointMinMaxCount()
 
 	region := ""
 	if r.NooBaa.Spec.Region != nil {
@@ -1041,9 +1032,13 @@ func (r *Reconciler) preparePVPoolBackingStore() error {
 
 	// create backing store
 	defaultPVSize := int64(50) * 1024 * 1024 * 1024 // 50GB
+	existingVolumes := 0
+	if r.DefaultBackingStore.Spec.PVPool != nil {
+		existingVolumes = r.DefaultBackingStore.Spec.PVPool.NumVolumes
+	}
 	r.DefaultBackingStore.Spec.Type = nbv1.StoreTypePVPool
 	r.DefaultBackingStore.Spec.PVPool = &nbv1.PVPoolSpec{}
-	r.DefaultBackingStore.Spec.PVPool.NumVolumes = 1
+	r.DefaultBackingStore.Spec.PVPool.NumVolumes = getPVPoolNumVolumes(r.NooBaa, existingVolumes)
 	r.DefaultBackingStore.Spec.PVPool.VolumeResources = &corev1.VolumeResourceRequirements{
 		Requests: corev1.ResourceList{
 			corev1.ResourceStorage: *resource.NewQuantity(defaultPVSize, resource.BinarySI),
@@ -1073,7 +1068,7 @@ func (r *Reconciler) fallbackToPVPoolWithEvent(backingStoreType nbv1.StoreType, 
 		backingStoreType, minutesToWaitForDefaultBSCreation, nbv1.StoreTypePVPool)
 	additionalInfoForLogs := fmt.Sprintf(" (could not get Secret %s).", secretName)
 	r.Logger.Info(message + additionalInfoForLogs)
-	r.Recorder.Event(r.NooBaa, corev1.EventTypeWarning, "DefaultBackingStoreFailure", message)
+	r.Recorder.Eventf(r.NooBaa, nil, corev1.EventTypeWarning, "DefaultBackingStoreFailure", "DefaultBackingStoreFailure", message)
 	if err := r.preparePVPoolBackingStore(); err != nil {
 		return err
 	}
@@ -1107,7 +1102,7 @@ func (r *Reconciler) prepareAWSBackingStore() error {
 	// create the actual S3 bucket
 	region, err := util.GetAWSRegion()
 	if err != nil {
-		r.Recorder.Eventf(r.NooBaa, corev1.EventTypeWarning, "DefaultBackingStoreFailure",
+		r.Recorder.Eventf(r.NooBaa, nil, corev1.EventTypeWarning, "DefaultBackingStoreFailure", "DefaultBackingStoreFailure",
 			"Failed to get AWSRegion. using	 us-east-1 as the default region. %q", err)
 		region = "us-east-1"
 	}
@@ -1313,29 +1308,46 @@ func (r *Reconciler) prepareGCPBackingStore() error {
 			return fmt.Errorf("got error on GCPBucketCreds creation. error: %v", err)
 		}
 	}
-	authJSON := &gcpAuthJSON{}
-	err := json.Unmarshal([]byte(cloudCredsSecret.StringData["service_account.json"]), authJSON)
-	if err != nil {
-		fmt.Println("Failed to parse secret", err)
-		return err
+	credsJSON := cloudCredsSecret.StringData["service_account.json"]
+	if credsJSON == "" {
+		return fmt.Errorf("cloud credentials secret %q is missing service_account.json", secretName)
 	}
-	projectID := authJSON.ProjectID
+	isExternalAccount, serviceAccountEmail, err := util.ParseGoogleCredentials(credsJSON)
+	if err != nil {
+		return fmt.Errorf("failed to parse GCP credentials from secret %q: %w", secretName, err)
+	}
 	if r.GCPBucketCreds.StringData == nil {
 		r.Logger.Infof("Secret %q does not contain a map of StringData yet. retry on next reconcile...", secretName)
 		return fmt.Errorf("cloud credentials secret %q is not ready yet (does not contain a map of StringData yet)", secretName)
 	}
-	r.GCPBucketCreds.StringData["GoogleServiceAccountPrivateKeyJson"] = cloudCredsSecret.StringData["service_account.json"]
-	ctx := context.Background()
-	gcpclient, err := storage.NewClient(ctx, option.WithCredentialsJSON([]byte(cloudCredsSecret.StringData["service_account.json"])))
-	if err != nil {
-		r.Logger.Info(err)
-		return err
+	if isExternalAccount {
+		delete(r.GCPBucketCreds.StringData, util.GoogleServiceAccountPrivateKeyJson)
+		r.GCPBucketCreds.StringData[util.GoogleCredentialsJson] = credsJSON
+	} else {
+		delete(r.GCPBucketCreds.StringData, util.GoogleCredentialsJson)
+		r.GCPBucketCreds.StringData[util.GoogleServiceAccountPrivateKeyJson] = credsJSON
 	}
 
-	var bucketName = strings.ToLower(randname.GenerateWithPrefix("noobaabucket", 5))
-	if err := r.createGCPBucketForBackingStore(gcpclient, projectID, bucketName); err != nil {
-		r.Logger.Info(err)
-		return err
+	var bucketName string
+	if isExternalAccount {
+		projectID, err := util.GcpProjectIDFromServiceAccountEmail(serviceAccountEmail)
+		if err != nil {
+			return err
+		}
+		bucketName, err = r.createGCPBucketWithCredentialsJSON(credsJSON, projectID)
+		if err != nil {
+			return err
+		}
+	} else {
+		authJSON := &gcpAuthJSON{}
+		err := json.Unmarshal([]byte(credsJSON), authJSON)
+		if err != nil {
+			return fmt.Errorf("failed to parse service_account credentials: %w", err)
+		}
+		bucketName, err = r.createGCPBucketWithCredentialsJSON(credsJSON, authJSON.ProjectID)
+		if err != nil {
+			return err
+		}
 	}
 
 	if errUpdate := r.Client.Update(r.Ctx, r.GCPBucketCreds); errUpdate != nil {
@@ -1454,6 +1466,20 @@ func (r *Reconciler) prepareIBMBackingStore() error {
 	return nil
 }
 
+func (r *Reconciler) createGCPBucketWithCredentialsJSON(credentialsJSON, projectID string) (string, error) {
+	bucketName := strings.ToLower(randname.GenerateWithPrefix("noobaabucket", 5))
+	ctx := context.Background()
+	gcpclient, err := storage.NewClient(ctx, option.WithAuthCredentialsJSON(option.ServiceAccount, []byte(credentialsJSON)))
+	if err != nil {
+		r.Logger.Errorf("got error creating GCP storage client. error: %v", err)
+		return "", err
+	}
+	if err := r.createGCPBucketForBackingStore(gcpclient, projectID, bucketName); err != nil {
+		return "", err
+	}
+	return bucketName, nil
+}
+
 func (r *Reconciler) createGCPBucketForBackingStore(client *storage.Client, projectID, bucketName string) error {
 	// [START create_bucket]
 	ctx := context.Background()
@@ -1461,6 +1487,7 @@ func (r *Reconciler) createGCPBucketForBackingStore(client *storage.Client, proj
 	ctx, cancel := context.WithTimeout(ctx, time.Second*30)
 	defer cancel()
 	if err := client.Bucket(bucketName).Create(ctx, projectID, nil); err != nil {
+		r.Logger.Errorf("got error when trying to create bucket %s. error: %v", bucketName, err)
 		return err
 	}
 	// [END create_bucket]
@@ -1754,9 +1781,10 @@ func (r *Reconciler) setDesiredServiceMonitorS3() error {
 // setServiceMonitorEndpointsToHTTPS updates all endpoints to use the given HTTPS
 // port name and sets the scheme to "https", ensuring upgrades from HTTP work correctly.
 func (r *Reconciler) setServiceMonitorEndpointsToHTTPS(endpoints []monitoringv1.Endpoint, portName string) {
+	schemeHTTPS := monitoringv1.SchemeHTTPS
 	for i := range endpoints {
 		endpoints[i].Port = portName
-		endpoints[i].Scheme = "https"
+		endpoints[i].Scheme = &schemeHTTPS
 	}
 }
 
@@ -1908,9 +1936,6 @@ func (r *Reconciler) UpdateBucketClassesPhase(Buckets []nb.BucketInfo) {
 
 // ReconcileDeploymentEndpointStatus creates/updates the endpoints deployment
 func (r *Reconciler) ReconcileDeploymentEndpointStatus() error {
-	if util.IsRemoteClientNoobaa(r.NooBaa.GetAnnotations()) {
-		return nil
-	}
 	if !util.KubeCheck(r.DeploymentEndpoint) {
 		return fmt.Errorf("Could not load endpoint deployment")
 	}
@@ -2077,7 +2102,6 @@ func derefAzureBlobString(p *string) string {
 	}
 	return *p
 }
-
 
 // lastAdmissionTLSSpec caches the most recently applied APIServerSecurity spec
 // so that we only trigger a TLS reload when the settings actually change.

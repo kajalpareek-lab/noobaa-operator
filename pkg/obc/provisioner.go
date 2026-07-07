@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strconv"
 	"time"
 
@@ -27,12 +28,16 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
+type externalDNSService string
+
 const (
-	allNamespaces = ""
+	allNamespaces                                = ""
+	externalDNSServiceS3      externalDNSService = "s3"
+	externalDNSServiceVectors externalDNSService = "vectors"
 )
 
 var excludeBucketTaggingLabelKeysSet = map[string]struct{}{
@@ -51,13 +56,13 @@ var excludeBucketTaggingLabelKeysSet = map[string]struct{}{
 type Provisioner struct {
 	client    client.Client
 	scheme    *runtime.Scheme
-	recorder  record.EventRecorder
+	recorder  events.EventRecorder
 	Logger    *logrus.Entry
 	Namespace string
 }
 
 // RunProvisioner will run OBC provisioner
-func RunProvisioner(client client.Client, scheme *runtime.Scheme, recorder record.EventRecorder) error {
+func RunProvisioner(client client.Client, scheme *runtime.Scheme, recorder events.EventRecorder) error {
 
 	provisionerName := options.ObjectBucketProvisionerName()
 	log := logrus.WithField("provisioner", provisionerName)
@@ -389,12 +394,12 @@ func NewBucketRequest(
 				msg = fmt.Sprintf("BucketClass %q not found in namespace %q", bucketClassName, p.Namespace)
 			}
 
-			p.recorder.Event(r.OBC, "Warning", "MissingBucketClass", msg)
+			p.recorder.Eventf(r.OBC, nil, "Warning", "MissingBucketClass", "MissingBucketClass", msg)
 			return nil, errors.New(msg)
 		}
 		if r.BucketClass.Status.Phase != nbv1.BucketClassPhaseReady {
 			msg := fmt.Sprintf("BucketClass %q is not ready", bucketClassName)
-			p.recorder.Event(r.OBC, "Warning", "BucketClassNotReady", msg)
+			p.recorder.Eventf(r.OBC, nil, "Warning", "BucketClassNotReady", "BucketClassNotReady", msg)
 			return nil, errors.New(msg)
 		}
 
@@ -403,6 +408,20 @@ func NewBucketRequest(
 		if r.BucketClass.Spec.VectorPolicy != nil {
 			endpointHostname = vectorsHostname
 			endpointPort = vectorsPort
+		}
+		if util.IsRemoteObcAnnotation(r.OBC.Annotations) {
+			extSvc := externalDNSServiceS3
+			if r.BucketClass.Spec.VectorPolicy != nil {
+				extSvc = externalDNSServiceVectors
+			}
+			extHost, extPort, externalErr := getExternalDNSDetails(sysClient.NooBaa, extSvc)
+			if externalErr != nil {
+				p.recorder.Eventf(r.OBC, nil, "Warning", "RemoteOBCExternalDNSUnavailable", "RemoteOBCExternalDNSUnavailable",
+					fmt.Sprintf("using internal DNS details: %v", externalErr))
+			} else {
+				endpointHostname = extHost
+				endpointPort = extPort
+			}
 		}
 
 		additionalConfig := r.OBC.Spec.AdditionalConfig
@@ -435,7 +454,11 @@ func NewBucketRequest(
 		r.AccountName = ob.Spec.AdditionalState["account"]
 		bucketClassName := ob.Spec.AdditionalState["bucketclass"]
 
-		bucketClass, exists := getBucketClass(r.OBC, bucketOptions, p.Namespace, util.KubeCheck)
+		obcNamespace := ""
+		if ob.Spec.ClaimRef != nil {
+			obcNamespace = ob.Spec.ClaimRef.Namespace
+		}
+		bucketClass, exists := getBucketClassByName(bucketClassName, obcNamespace, p.Namespace, util.KubeCheck)
 		if !exists {
 			p.Logger.Warnf("BucketClass %q not found in namespace %q", bucketClassName, p.Namespace)
 		}
@@ -541,6 +564,13 @@ func (r *BucketRequest) CreateAndUpdateBucket(
 			return fmt.Errorf("CreateTieringStructure for PlacementPolicy failed to create policy %q with error: %v", tierName, err)
 		}
 		createBucketParams.Tiering = tierName
+		if r.BucketClass.Spec.ArchivePolicy != nil {
+			createBucketParams.ArchivePolicy = &nb.ArchivePolicyConfig{
+				DeepArchiveResource: &nb.NamespaceResourceFullConfig{
+					Resource: r.BucketClass.Spec.ArchivePolicy.DeepArchiveResource,
+				},
+			}
+		}
 	}
 
 	// create NS bucket
@@ -884,16 +914,10 @@ func (r *BucketRequest) updateReplicationPolicy(ob *nbv1.ObjectBucket) error {
 	return nil
 }
 
-// getBucketClass takes an OBC, bucketoptions and provisioner namespace and returns the bucketClass
-//
-// If BucketClass name is not specified in the OBC, then the empty string is returned with exists=false
-// If BucketClass name is specified in the OBC, then:
-// - if the bucketclass is found in the obc namespace, then that bucketclass is returned
-// with exists=true
-// - if the bucketclass is found in the provisioner namespace, then that buckeclass is
-// returned with exists=true
-// - if the bucketclass is not found in the obc namespace or the provisioner namespace, then the
-// bucketclass with namespace set to provisioner namespace is returned with exists=false
+// getBucketClass extracts the bucket class name from an OBC (or StorageClass parameters)
+// and delegates to getBucketClassByName. Used by the create/provision path where a full
+// ObjectBucketClaim is available. On the update path (ObjectBucket only), callers should
+// use getBucketClassByName directly with values from AdditionalState and ClaimRef.
 func getBucketClass(
 	obc *nbv1.ObjectBucketClaim,
 	bucketOptions *obAPI.BucketOptions,
@@ -916,16 +940,40 @@ func getBucketClass(
 	if bucketclassName == "" && bucketOptions != nil {
 		bucketclassName = bucketOptions.Parameters["bucketclass"]
 	}
-	if bucketclassName == "" {
+	return getBucketClassByName(bucketclassName, obc.Namespace, provisionerNS, checkExists)
+}
+
+// getBucketClassByName looks up a BucketClass by name in the OBC namespace first,
+// then in the provisioner (NooBaa system) namespace.
+//
+// If bucketClassName is empty, returns exists=false.
+// If found in obcNamespace, returns that BucketClass with exists=true.
+// If found in provisionerNS, returns that BucketClass with exists=true.
+// If not found, returns a BucketClass with namespace set to provisionerNS and exists=false.
+func getBucketClassByName(
+	bucketClassName, obcNamespace, provisionerNS string,
+	checkExists func(client.Object) bool,
+) (bc *nbv1.BucketClass, exists bool) {
+	bucketClass := &nbv1.BucketClass{
+		TypeMeta: metav1.TypeMeta{Kind: "BucketClass"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "",
+			Namespace: "",
+		},
+	}
+
+	if bucketClassName == "" {
 		return bucketClass, false
 	}
 
-	bucketClass.SetName(bucketclassName)
+	bucketClass.SetName(bucketClassName)
 
 	// Find the bucketclass in the same namespace as the OBC
-	bucketClass.SetNamespace(obc.Namespace)
-	if checkExists(bucketClass) {
-		return bucketClass, true
+	if obcNamespace != "" {
+		bucketClass.SetNamespace(obcNamespace)
+		if checkExists(bucketClass) {
+			return bucketClass, true
+		}
 	}
 
 	// Find the bucketclass in the provisioner namespace
@@ -935,4 +983,38 @@ func getBucketClass(
 	}
 
 	return bucketClass, false
+}
+
+// getExternalDNSDetails returns hostname and port for the ObjectBucket ConfigMap from NooBaa status ExternalDNS
+func getExternalDNSDetails(nb *nbv1.NooBaa, svc externalDNSService) (string, int, error) {
+	if nb == nil || nb.Status.Services == nil {
+		return "", 0, fmt.Errorf("no services found in status")
+	}
+	var externalDNS []string
+	switch svc {
+	case externalDNSServiceS3:
+		externalDNS = nb.Status.Services.ServiceS3.ExternalDNS
+	case externalDNSServiceVectors:
+		externalDNS = nb.Status.Services.ServiceVectors.ExternalDNS
+	default:
+		return "", 0, fmt.Errorf("unknown external DNS service %q", svc)
+	}
+	if len(externalDNS) == 0 {
+		return "", 0, fmt.Errorf("no external %q service endpoint in status (Route or LoadBalancer)", svc)
+	}
+	// ExternalDNS order is defined in CheckServiceStatus:
+	// append Route URL when route.Spec.Host is set, then append each LoadBalancer ingress hostname.
+	// For status produced by that code, when both exist index 0 is always the Route URL;
+	primaryExternalDNS := externalDNS[0]
+	uri, err := url.ParseRequestURI(primaryExternalDNS)
+	if err != nil {
+		return "", 0, err
+	}
+	hostname := uri.Hostname()
+	portStr := uri.Port()
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return "", 0, fmt.Errorf("failed to parse external DNS in %q service: port %q. got error: %v", svc, portStr, err)
+	}
+	return hostname, port, nil
 }

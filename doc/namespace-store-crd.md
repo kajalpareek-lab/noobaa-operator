@@ -10,6 +10,7 @@ Supported NamespaceStore types:
 - ibm-cos
 - google-cloud-storage
 - azure-blob
+- azure-sts-blob
 
 # Definitions
 - CRD: [noobaa.io_NamespaceStores_crd.yaml](../deploy/crds/noobaa.io_namespacestores_crd.yaml)
@@ -100,6 +101,37 @@ spec:
   type: s3-compatible
 ```
 
+### S3 Compatible - Deep Archive
+Uses an S3-compatible API to write objects directly to a tape-based cold storage endpoint (e.g. IBM Deep Archive).
+This store type is intended for S3-compatible long-term archive where data is written once and read infrequently.
+
+`archive: true` - A flag that indicates the endpoint is a tape-based or cold-storage target (e.g. IBM Deep Archive).
+Archive stores can only be referenced via `archivePolicy` in a BucketClass; they cannot be used inside a `namespacePolicy`.
+
+```shell
+noobaa namespacestore create s3-compatible <NAMESPACESTORE NAME> --archive \
+  --endpoint <> --target-bucket <> --access-key <> --secret-key <> 
+```
+
+```yaml
+apiVersion: noobaa.io/v1alpha1
+kind: NamespaceStore
+metadata:
+  finalizers:
+  - noobaa.io/finalizer
+  name: <>
+  namespace: <>
+spec:
+  archive: true
+  s3Compatible:
+    endpoint: <>
+    secret:
+      name: <>
+      namespace: <>
+    targetBucket: <>
+  type: s3-compatible
+```
+
 ## IBM COS
 Uses the IBM COS API for IO operations on plain data in IBM COS buckets
 ```shell
@@ -176,7 +208,7 @@ This type of namespacestore is useful in cases where the user wishes to use shor
 Prior to using this namespacestore, Azure Workload Identity needs to be set up on the AKS cluster, which is outside the scope of these docs.
 
 ```shell
-noobaa namespacestore create azure-sts-blob <NAMESPACESTORE NAME> --target-blob-container <> --tenant-id <> --client-id <>
+noobaa namespacestore create azure-sts-blob <NAMESPACESTORE NAME> --account-name <> --target-blob-container <> --tenant-id <> --client-id <>
 ```
 ```yaml
 apiVersion: noobaa.io/v1alpha1
@@ -195,6 +227,7 @@ spec:
       namespace: <>
   type: azure-blob
 ```
+The secret must contain the following keys: `AccountName`, `azure_tenant_id`, and `azure_client_id`.
 
 ## Examples
 ### AWS S3
@@ -217,6 +250,42 @@ spec:
       namespace: secret-namespace
     targetBucket: personal-bucket
   type: aws-s3
+```
+
+### Azure STS Blob
+Note that the secret referenced below must contain `AccountName`, `azure_tenant_id`, and `azure_client_id`. When using the CLI, these are populated automatically from the provided flags.
+```shell
+noobaa namespacestore create azure-sts-blob azure-sts-namespacestore --account-name azureSTSAccount --target-blob-container azure-sts-ns --client-id 8feb6304-7cee-40ea-b501-ef0d08520874 --tenant-id 486b6304-7cee-40qw-n507-hy7d520123
+```
+```yaml
+apiVersion: noobaa.io/v1alpha1
+kind: NamespaceStore
+metadata:
+  finalizers:
+  - noobaa.io/finalizer
+  name: azure-sts-namespacestore
+  namespace: app-namespace
+spec:
+  azureBlob:
+    clientId: 8feb6304-7cee-40ea-b501-ef0d08520874
+    targetBlobContainer: azure-sts-ns
+    secret:
+      name: noobaa-azure-container-creds
+      namespace: noobaa
+  type: azure-blob
+```
+The secret `noobaa-azure-container-creds` should look like:
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: noobaa-azure-container-creds
+  namespace: noobaa
+type: Opaque
+stringData:
+  AccountName: azureSTSAccount
+  azure_tenant_id: 486b6304-7cee-40qw-n507-hy7d520123
+  azure_client_id: 8feb6304-7cee-40ea-b501-ef0d08520874
 ```
 
 ## Modifying a Namespace Store's Credentials

@@ -2,7 +2,6 @@ package namespacestore
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/url"
 	"strings"
@@ -21,7 +20,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -55,7 +54,7 @@ type Reconciler struct {
 	Scheme   *runtime.Scheme
 	Ctx      context.Context
 	Logger   *logrus.Entry
-	Recorder record.EventRecorder
+	Recorder events.EventRecorder
 	NBClient nb.Client
 
 	NamespaceStore *nbv1.NamespaceStore
@@ -63,9 +62,9 @@ type Reconciler struct {
 	Secret         *corev1.Secret
 	ServiceAccount *corev1.ServiceAccount
 
-	SystemInfo             *nb.SystemInfo
-	ExternalConnectionInfo *nb.ExternalConnectionInfo
-	NamespaceResourceinfo  *nb.NamespaceResourceInfo
+	SystemInfo              *nb.SystemInfo
+	ExternalConnectionInfo  *nb.ExternalConnectionInfo
+	NamespaceResourceinfo   *nb.NamespaceResourceInfo
 
 	AddExternalConnectionParams    *nb.AddExternalConnectionParams
 	CreateNamespaceResourceParams  *nb.CreateNamespaceResourceParams
@@ -82,7 +81,7 @@ func NewReconciler(
 	req types.NamespacedName,
 	client client.Client,
 	scheme *runtime.Scheme,
-	recorder record.EventRecorder,
+	recorder events.EventRecorder,
 ) *Reconciler {
 
 	r := &Reconciler{
@@ -166,7 +165,7 @@ func (r *Reconciler) completeReconcile(err error) (reconcile.Result, error) {
 			r.SetPhase(nbv1.NamespaceStorePhaseRejected, perr.Reason, perr.Message)
 			log.Errorf("❌ Persistent Error: %s", err)
 			if r.Recorder != nil {
-				r.Recorder.Eventf(r.NamespaceStore, corev1.EventTypeWarning, perr.Reason, perr.Message)
+				r.Recorder.Eventf(r.NamespaceStore, nil, corev1.EventTypeWarning, perr.Reason, perr.Reason, perr.Message)
 			}
 		} else {
 			res.RequeueAfter = 3 * time.Second
@@ -183,7 +182,7 @@ func (r *Reconciler) completeReconcile(err error) (reconcile.Result, error) {
 			desc := fmt.Sprintf("Namespace store mode: %s", mode)
 			r.SetPhase(phaseInfo.Phase, desc, phaseName)
 			if r.Recorder != nil {
-				r.Recorder.Eventf(r.NamespaceStore, phaseInfo.Severity, phaseName, desc)
+				r.Recorder.Eventf(r.NamespaceStore, nil, phaseInfo.Severity, phaseName, phaseName, desc)
 			}
 		} else {
 			r.SetPhase(
@@ -385,17 +384,22 @@ func (r *Reconciler) ReconcileDeletion(systemFound bool) error {
 			}
 		}
 
-		if r.ExternalConnectionInfo != nil {
-			// TODO we cannot assume we are the only one using this connection...
-			err := r.NBClient.DeleteExternalConnectionAPI(nb.DeleteExternalConnectionParams{Name: r.ExternalConnectionInfo.Name})
+		if r.NBClient != nil && r.NamespaceStore.Spec.Type != nbv1.NSStoreTypeNSFS {
+			hasOwned, err := r.hasOwnedExternalConnection()
 			if err != nil {
-				if rpcErr, isRPCErr := err.(*nb.RPCError); isRPCErr {
-					if rpcErr.RPCCode != "IN_USE" {
+				return err
+			}
+			if hasOwned {
+				err := r.NBClient.DeleteExternalConnectionAPI(nb.DeleteExternalConnectionParams{Name: r.NamespaceStore.Name})
+				if err != nil {
+					if rpcErr, isRPCErr := err.(*nb.RPCError); isRPCErr {
+						if rpcErr.RPCCode != "IN_USE" {
+							return err
+						}
+						r.Logger.Warnf("DeleteExternalConnection cannot complete because it is IN_USE %q", r.NamespaceStore.Name)
+					} else {
 						return err
 					}
-					r.Logger.Warnf("DeleteExternalConnection cannot complete because it is IN_USE %q", r.ExternalConnectionInfo.Name)
-				} else {
-					return err
 				}
 			}
 		}
@@ -403,6 +407,22 @@ func (r *Reconciler) ReconcileDeletion(systemFound bool) error {
 
 	r.Logger.Infof("NamepsaceStore %q remove finalizer", r.NamespaceStore.Name)
 	return r.FinalizeDeletion()
+}
+
+// hasOwnedExternalConnection checks list_accounts for an external connection named like this NamespaceStore
+func (r *Reconciler) hasOwnedExternalConnection() (bool, error) {
+	accountsList, err := r.NBClient.ListAccountsAPI(nb.ListAccountsParams{})
+	if err != nil {
+		return false, err
+	}
+	for _, account := range accountsList.Accounts {
+		for i := range account.ExternalConnections.Connections {
+			if account.ExternalConnections.Connections[i].Name == r.NamespaceStore.Name {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
 }
 
 // FinalizeDeletion removed the finalizer and updates in order to let the namespace-store get reclaimed by kubernetes
@@ -439,6 +459,10 @@ func (r *Reconciler) ReadSystemInfo() error {
 			r.NamespaceResourceinfo = nsr
 			break
 		}
+	}
+
+	if r.NamespaceStore.DeletionTimestamp != nil {
+		return nil
 	}
 
 	nsr := r.NamespaceResourceinfo
@@ -494,8 +518,12 @@ func (r *Reconciler) ReadSystemInfo() error {
 		account := &r.SystemInfo.Accounts[i]
 		for j := range account.ExternalConnections.Connections {
 			c := &account.ExternalConnections.Connections[j]
+			endpointsEqual, epErr := validations.EndpointsEquivalent(c.Endpoint, conn.Endpoint)
+			if epErr != nil {
+				return epErr
+			}
 			if c.EndpointType == conn.EndpointType &&
-				c.Endpoint == conn.Endpoint &&
+				endpointsEqual &&
 				c.Identity == string(conn.Identity) {
 				r.ExternalConnectionInfo = c
 				conn.Name = c.Name
@@ -527,7 +555,7 @@ func (r *Reconciler) ReadSystemInfo() error {
 // LoadNamespaceStoreSecret loads the secret to the reconciler struct
 func (r *Reconciler) LoadNamespaceStoreSecret() error {
 	// Skip loading for AWS STS (no secret). For Azure STS use IsAzureSTSClusterNS(); load secret when it has a ref (TenantId/AccountName in secret).
-	if util.IsSTSClusterNS(r.NamespaceStore) {
+	if util.IsAWSSTSClusterNS(r.NamespaceStore) {
 		return nil
 	}
 	if util.IsAzureSTSClusterNS(r.NamespaceStore) && (r.NamespaceStore.Spec.AzureBlob == nil || r.NamespaceStore.Spec.AzureBlob.Secret.Name == "") {
@@ -596,7 +624,7 @@ func (r *Reconciler) MakeExternalConnectionParams() (*nb.AddExternalConnectionPa
 	switch r.NamespaceStore.Spec.Type {
 
 	case nbv1.NSStoreTypeAWSS3:
-		if util.IsSTSClusterNS(r.NamespaceStore) {
+		if util.IsAWSSTSClusterNS(r.NamespaceStore) {
 			conn.EndpointType = nb.EndpointTypeAwsSTS
 			conn.AWSSTSARN = *r.NamespaceStore.Spec.AWSS3.AWSSTSRoleARN
 		} else {
@@ -683,27 +711,34 @@ func (r *Reconciler) MakeExternalConnectionParams() (*nb.AddExternalConnectionPa
 		}
 
 	case nbv1.NSStoreTypeGoogleCloudStorage:
-		conn.EndpointType = nb.EndpointTypeGoogle
 		conn.Endpoint = "https://www.googleapis.com"
-		privateKeyJSON := r.Secret.StringData["GoogleServiceAccountPrivateKeyJson"]
-		privateKey := &struct {
-			ID string `json:"private_key_id"`
-		}{}
-		err := json.Unmarshal([]byte(privateKeyJSON), privateKey)
+		googleCredentialsJSON, err := util.GoogleCredentialsFromStoreSecret(r.Secret)
 		if err != nil {
 			return nil, util.NewPersistentError("InvalidGoogleSecret", fmt.Sprintf(
-				"Invalid secret for google type %q expected JSON in data.GoogleServiceAccountPrivateKeyJson",
-				r.Secret.Name,
+				"Invalid google credentials secret: %v", err,
 			))
 		}
-		conn.Identity = nb.MaskedString(privateKey.ID)
-		conn.Secret = nb.MaskedString(privateKeyJSON)
+
+		isGoogleExternalAccountJSON, identity, err := util.ParseGoogleCredentials(googleCredentialsJSON)
+		if err != nil {
+			return nil, util.NewPersistentError("InvalidGoogleSecret", fmt.Sprintf(
+				"Invalid secret for google type %q: invalid GCP credentials JSON: %v",
+				r.Secret.Name, err,
+			))
+		}
+		if isGoogleExternalAccountJSON {
+			conn.EndpointType = nb.EndpointTypeGoogleSTS
+		} else {
+			conn.EndpointType = nb.EndpointTypeGoogle
+		}
+		conn.Identity = nb.MaskedString(identity)
+		conn.Secret = nb.MaskedString(googleCredentialsJSON)
 
 	default:
 		return nil, util.NewPersistentError("InvalidType",
 			fmt.Sprintf("Invalid namespace store type %q", r.NamespaceStore.Spec.Type))
 	}
-	if util.IsSTSClusterNS(r.NamespaceStore) || util.IsAzureSTSClusterNS(r.NamespaceStore) {
+	if util.IsAWSSTSClusterNS(r.NamespaceStore) || util.IsAzureSTSClusterNS(r.NamespaceStore) {
 		if !util.IsStringGraphicOrSpacesCharsOnly(string(conn.Identity)) || !util.IsStringGraphicOrSpacesCharsOnly(string(conn.Secret)) {
 			return nil, util.NewPersistentError("InvalidSecret",
 				fmt.Sprintf("Invalid secret containing non graphic characters (perhaps not base64 encoded?) %q", r.Secret.Name))
@@ -740,7 +775,7 @@ func (r *Reconciler) fixAlternateKeysNames() {
 // ReconcileExternalConnection handles the external connection using noobaa api
 func (r *Reconciler) ReconcileExternalConnection() error {
 
-	if r.ExternalConnectionInfo != nil {
+	if r.ExternalConnectionInfo != nil && r.UpdateExternalConnectionParams == nil {
 		return nil
 	}
 

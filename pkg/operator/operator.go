@@ -39,6 +39,7 @@ func Cmd() *cobra.Command {
 		CmdStatus(),
 		CmdYaml(),
 		CmdRun(),
+		CmdSetLogLevel(),
 	)
 	return cmd
 }
@@ -100,8 +101,56 @@ func CmdRun() *cobra.Command {
 	return cmd
 }
 
+// CmdSetLogLevel returns a CLI command
+func CmdSetLogLevel() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "set-log-level <level>",
+		Short: "Sets the operator log level in noobaa-config. level can be 'warn', 'info', or 'debug'",
+		Run:   RunSetLogLevel,
+		Args:  cobra.ExactArgs(1),
+	}
+	return cmd
+}
+
+// RunSetLogLevel updates OPERATOR_LOG_LEVEL in the noobaa-config ConfigMap.
+func RunSetLogLevel(cmd *cobra.Command, args []string) {
+	log := util.Logger()
+	level := args[0]
+	switch level {
+	case "warn", "info", "debug":
+	default:
+		log.Fatalf(`invalid log-level argument %q. must be 'warn', 'info', or 'debug'. %s`, level, cmd.UsageString())
+	}
+
+	cm := util.KubeObject(bundle.File_deploy_internal_configmap_empty_yaml).(*corev1.ConfigMap)
+	cm.Namespace = options.Namespace
+	cm.Name = "noobaa-config"
+
+	_, _, err := util.KubeGet(cm)
+	if err != nil {
+		log.Fatalf(`❌ ConfigMap "noobaa-config" not found in namespace %q. Create a NooBaa system first.`, options.Namespace)
+	}
+
+	if cm.Data == nil {
+		cm.Data = map[string]string{}
+	}
+	cm.Data["OPERATOR_LOG_LEVEL"] = level
+
+	if !util.KubeUpdate(cm) {
+		log.Fatal(`❌ Failed to update ConfigMap "noobaa-config"`)
+	}
+
+	fmt.Println("")
+	fmt.Printf("Operator log level was set to %q successfully\n", level)
+	fmt.Println("The operator picks up the change on the next reconcile. Core and endpoint pods are not restarted.")
+}
+
 // RunUpgrade runs a CLI command
 func RunUpgrade(cmd *cobra.Command, args []string) {
+	if err := validateGCPWIFFlags(cmd); err != nil {
+		util.Logger().Fatalf("Invalid GCP WIF (STS) upgrade flags: %v", err)
+	}
+
 	c := LoadOperatorConf(cmd)
 	util.KubeApply(c.NS)
 	util.KubeApply(c.SA)
@@ -191,6 +240,8 @@ func RunUpgrade(cmd *cobra.Command, args []string) {
 		c.Deployment.Spec.Template.Spec.Containers[0].Env = operatorContainer.Env
 	}
 
+	appendGCPWIFEnvVars(&c.Deployment.Spec.Template.Spec.Containers[0], cmd)
+
 	noDeploy, _ := cmd.Flags().GetBool("no-deploy")
 	if !noDeploy {
 		operatorContainer := c.Deployment.Spec.Template.Spec.Containers[0]
@@ -208,6 +259,10 @@ func RunUpgrade(cmd *cobra.Command, args []string) {
 
 // RunInstall runs a CLI command
 func RunInstall(cmd *cobra.Command, args []string) {
+	if err := validateGCPWIFFlags(cmd); err != nil {
+		util.Logger().Fatalf("Invalid GCP WIF (STS) install flags: %v", err)
+	}
+
 	c := LoadOperatorConf(cmd)
 	util.KubeCreateSkipExisting(c.NS)
 	util.KubeCreateSkipExisting(c.SA)
@@ -305,6 +360,8 @@ func RunInstall(cmd *cobra.Command, args []string) {
 		})
 		c.Deployment.Spec.Template.Spec.Containers[0].Env = operatorContainer.Env
 	}
+
+	appendGCPWIFEnvVars(&c.Deployment.Spec.Template.Spec.Containers[0], cmd)
 
 	noDeploy, _ := cmd.Flags().GetBool("no-deploy")
 	if !noDeploy {
@@ -689,4 +746,34 @@ func AdmissionWebhookSetup(c *Conf) {
 
 func configureClusterRole(cr *rbacv1.ClusterRole) {
 	cr.Name = options.SubDomainNS()
+}
+
+func validateGCPWIFFlags(cmd *cobra.Command) error {
+	projectNumber, _ := cmd.Flags().GetString("google-cloud-project-number")
+	poolID, _ := cmd.Flags().GetString("google-cloud-pool-id")
+	providerID, _ := cmd.Flags().GetString("google-cloud-provider-id")
+	serviceAccountEmail, _ := cmd.Flags().GetString("google-cloud-service-account-email")
+	return util.ValidateGCPWIFParams(projectNumber, poolID, providerID, serviceAccountEmail)
+}
+
+// appendGCPWIFEnvVars appends GCP WIF (STS) environment variables to the operator container
+func appendGCPWIFEnvVars(operatorContainer *corev1.Container, cmd *cobra.Command) {
+	// flag to env var mapping
+	for _, flagEnv := range []struct {
+		envName string
+		flag    string
+	}{
+		{"PROJECT_NUMBER", "google-cloud-project-number"},
+		{"POOL_ID", "google-cloud-pool-id"},
+		{"PROVIDER_ID", "google-cloud-provider-id"},
+		{"SERVICE_ACCOUNT_EMAIL", "google-cloud-service-account-email"},
+	} {
+		value, _ := cmd.Flags().GetString(flagEnv.flag)
+		if value != "" {
+			operatorContainer.Env = append(operatorContainer.Env, corev1.EnvVar{
+				Name:  flagEnv.envName,
+				Value: value,
+			})
+		}
+	}
 }

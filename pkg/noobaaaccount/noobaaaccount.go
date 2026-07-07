@@ -11,6 +11,7 @@ import (
 	"github.com/noobaa/noobaa-operator/v5/pkg/options"
 	"github.com/noobaa/noobaa-operator/v5/pkg/system"
 	"github.com/noobaa/noobaa-operator/v5/pkg/util"
+	"github.com/noobaa/noobaa-operator/v5/pkg/validations"
 
 	"github.com/spf13/cobra"
 	corev1 "k8s.io/api/core/v1"
@@ -207,15 +208,8 @@ func RunCreate(cmd *cobra.Command, args []string) {
 		defaultResource = sys.Name + "-default-backing-store"
 	}
 
-	isResourceBackingStore := checkResourceBackingStore(defaultResource)
-	isResourceNamespaceStore := checkResourceNamespaceStore(defaultResource)
-
-	if isResourceBackingStore && isResourceNamespaceStore {
-		log.Fatalf(`❌  got BackingStore and NamespaceStore %q in namespace %q`,
-			defaultResource, options.Namespace)
-	} else if !isResourceBackingStore && !isResourceNamespaceStore {
-		log.Fatalf(`❌ Could not get BackingStore or NamespaceStore %q in namespace %q`,
-			defaultResource, options.Namespace)
+	if err := validations.ValidateAccountDefaultResource(*noobaaAccount); err != nil {
+		log.Fatalf(`❌ %s`, err.Error())
 	}
 
 	noobaaAccount.Spec.DefaultResource = defaultResource
@@ -262,7 +256,7 @@ func RunUpdate(cmd *cobra.Command, args []string) {
 	noobaaAccount.Name = name
 	noobaaAccount.Namespace = options.Namespace
 
-	sysClient, err := system.Connect(true)
+	sysClient, err := system.ConnectAuto()
 	if err != nil {
 		log.Fatalf("❌ failed to run RPC call: %s", err)
 	}
@@ -309,7 +303,7 @@ func RunUpdate(cmd *cobra.Command, args []string) {
 			RunStatus(cmd, args)
 		}
 	} else {
-		sysClient, err := system.Connect(true)
+		sysClient, err := system.ConnectAuto()
 		if err != nil {
 			log.Fatalf(`❌ Unable to create RPC client %s`, err)
 		}
@@ -620,7 +614,7 @@ func GenerateAccountKeys(name string) error {
 
 	var accessKeys nb.S3AccessKeys
 
-	sysClient, err := system.Connect(true)
+	sysClient, err := system.ConnectAuto()
 	if err != nil {
 		return err
 	}
@@ -677,7 +671,7 @@ func GenerateNonCrdAccountKeys(name string) error {
 
 	var accessKeys nb.S3AccessKeys
 
-	sysClient, err := system.Connect(true)
+	sysClient, err := system.ConnectAuto()
 	if err != nil {
 		return err
 	}
@@ -714,7 +708,7 @@ func GenerateNonCrdAccountKeys(name string) error {
 func UpdateAccountKeys(name string, accessKeys nb.S3AccessKeys) error {
 	log := util.Logger()
 
-	sysClient, err := system.Connect(true)
+	sysClient, err := system.ConnectAuto()
 	if err != nil {
 		return err
 	}
@@ -770,7 +764,7 @@ func UpdateAccountKeys(name string, accessKeys nb.S3AccessKeys) error {
 func UpdateNonCrdAccountKeys(name string, accessKeys nb.S3AccessKeys) error {
 	log := util.Logger()
 
-	sysClient, err := system.Connect(true)
+	sysClient, err := system.ConnectAuto()
 	if err != nil {
 		return err
 	}
@@ -816,32 +810,4 @@ func ValidateAccessKeys(accessKeys nb.S3AccessKeys) {
 	if !util.SecretKeyRegexp.MatchString(string(accessKeys.SecretKey)) {
 		log.Fatalf(`❌ Account secret length must be 40, and must contain only alpha-numeric chars, "+", "/"`)
 	}
-}
-
-// checkResourceBackingStore checks if a resourceName exists and if BackingStore
-func checkResourceBackingStore(resourceName string) bool {
-	// check that a backing store exists
-	resourceBackingStore := &nbv1.BackingStore{
-		TypeMeta: metav1.TypeMeta{Kind: "BackingStore"},
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      resourceName,
-			Namespace: options.Namespace,
-		},
-	}
-
-	return util.KubeCheckQuiet(resourceBackingStore)
-}
-
-// checkResourceNamespaceStore checks if a resourceName exists and if NamespaceStore
-func checkResourceNamespaceStore(resourceName string) bool {
-	// check that a namespace store exists
-	resourceNamespaceStore := &nbv1.NamespaceStore{
-		TypeMeta: metav1.TypeMeta{Kind: "NamespaceStore"},
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      resourceName,
-			Namespace: options.Namespace,
-		},
-	}
-
-	return util.KubeCheckQuiet(resourceNamespaceStore)
 }

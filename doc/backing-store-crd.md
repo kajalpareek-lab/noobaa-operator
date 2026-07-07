@@ -32,6 +32,11 @@ Also note that, if possible and applicable, omitting the `access-key` and `secre
 If the user opts to use the CLI's `--secret-name` option, or to apply a YAML, please see [Store Secret Creation](store-connection-secrets.md).
 In case of YAML application, the value under `secret.namespace` needs to point to the secret's namespace.
 
+# Cloud Storage Permissions
+To successfully initialize a BackingStore, the provided cloud credentials must have sufficient permissions to manage the target bucket and list all buckets within the account. This listing is required for NooBaa’s external connection validation.
+
+If permissions are insufficient, the BackingStore will remain in the `Creating` phase with a `TemporaryError`. After several retry attempts, it will ultimately transition to the `Rejected` phase.
+
 ## AWS S3
 Uses the S3 API for storing encrypted chunks of data in AWS buckets
 ```shell
@@ -54,6 +59,10 @@ spec:
   type: aws-s3
 ```
 
+Permissions: the user need to have permissions in AWS account for AWS S3 service:
+1. Account level: `s3:ListAllMyBuckets`
+2. Bucket level: grant access on both `arn:aws:s3:::<target-bucket>` and `arn:aws:s3:::<target-bucket>/*` (bucket and object ARNs are both required).
+
 ## AWS-S3 Security Token Service (STS)
 Similarly to `AWS-S3` this backingstore uses the S3 API for storing encrypted chunks of data in AWS buckets.
 However, the difference between the two backingstore types lies in the authentication method:
@@ -62,7 +71,7 @@ However, the difference between the two backingstore types lies in the authentic
 
 This type of backingstore is useful in cases where the user wishes to limit access to their AWS cloud for a specific amount of time, and for easier management of the cloud's security.
 
-Prior to using this backingstore, an OpenIDConnect provider needs to be set up, which is outside the scope of these docs.
+Before using this backingstore, an OpenIDConnect provider needs to be set up, which is outside the scope of these docs.
 
 ```shell
 noobaa backingstore create aws-sts-s3 <BACKINGSTORE NAME> --target-bucket <> --aws-sts-arn <>
@@ -134,10 +143,48 @@ spec:
   type: ibm-cos
 ```
 
-## Google Cloud Storage
+## Google Cloud Storage (GCP)
 Uses the Google Cloud Storage API for storing encrypted chunks of data in Google Cloud buckets
 ```shell
 noobaa backingstore create google-cloud-storage <BACKINGSTORE NAME> --private-key-json-file <PATH TO credentials.json> --target-bucket <>
+```
+```yaml
+apiVersion: noobaa.io/v1alpha1
+kind: BackingStore
+metadata:
+  finalizers:
+  - noobaa.io/finalizer
+  name: <>
+  namespace: <>
+spec:
+  googleCloudStorage:
+    secret:
+      name: <>
+      namespace: <>
+    targetBucket: <>
+  type: google-cloud-storage
+```
+
+The `credentials.json` is an example path to the Google Cloud service account JSON key. Service account keys are used to authenticate a service account to Google Cloud APIs. When you create a key, you download the private key, which you can then use to authenticate your application.  
+
+Permissions: the service account should have the `storage.buckets.list` permission. You can grant it by assigning project-level roles, for example:
+- Combination of the Browser and Storage Admin roles.
+  - `Browser` role: provides the `storage.buckets.list` permission.
+  - `Storage Admin` role: provides full control over buckets and objects.
+- The `Owner` role (for development; not recommended for production environments).
+
+## Google Cloud Storage Workload Identity Federation (GCP WIF, STS)
+Similarly to `Google Cloud Storage` this backing store uses the Google Cloud Storage API for storing encrypted chunks of data in GCP buckets.
+However, the difference between the two backingstore types lies in the authentication method:
+- `google-cloud-storage` uses long-lived `service_account` JSON keys.
+- `google-cloud-storage-sts` uses a short-lived token via GCP Workload Identity Federation: the JSON type is `external_account`, which is built from parameters (`PROJECT_NUMBER`, `POOL_ID`, `PROVIDER_ID`, `SERVICE_ACCOUNT_EMAIL`).
+
+This type of backingstore is useful in cases where the user wishes to limit access to their GCP cloud for a specific amount of time, and for easier management of the cloud's security.
+
+Before using this backingstore, there are configurations that need to be done on the GCP account and on the cluster (for example, an OpenIDConnect provider needs to be set up) which is outside the scope of these docs.
+
+```shell
+noobaa backingstore create google-cloud-storage-sts <BACKINGSTORE NAME> --target-bucket <> --project-number <> --pool-id <> --provider-id <> --service-account-email <>
 ```
 ```yaml
 apiVersion: noobaa.io/v1alpha1
@@ -301,6 +348,52 @@ spec:
       namespace: noobaa
       targetBlobContainer: azure-sts-bs
 type: azure-blob
+```
+
+### GCP
+```shell
+noobaa backingstore create google-cloud-storage gcp-bs --target-bucket personal-bucket --private-key-json-file '/example/path'
+```
+```yaml
+apiVersion: noobaa.io/v1alpha1
+kind: BackingStore
+metadata:
+  finalizers:
+  - noobaa.io/finalizer
+  labels:
+    app: noobaa
+  name: gcp-bs
+  namespace: app-namespace
+spec:
+  googleCloudStorage:
+    secret:
+      name: backing-store-google-cloud-storage-gcp-bs
+      namespace: secret-namespace
+    targetBucket: personal-bucket
+  type: google-cloud-storage
+```
+
+### GCP WIF (STS)
+```shell
+noobaa backingstore create google-cloud-storage-sts gcp-bs-sts --project-number='123456789' --pool-id='my-pool' --provider-id='my-provider' --service-account-email='noobaa-wif-sa@my-project.iam.gserviceaccount.com' --target-bucket personal-bucket
+```
+```yaml
+apiVersion: noobaa.io/v1alpha1
+kind: BackingStore
+metadata:
+  finalizers:
+  - noobaa.io/finalizer
+  labels:
+    app: noobaa
+  name: gcp-bs-sts
+  namespace: app-namespace
+spec:
+  googleCloudStorage:
+    secret:
+      name: backing-store-google-cloud-storage-gcp-bs-sts
+      namespace: secret-namespace
+    targetBucket: personal-bucket
+  type: google-cloud-storage
 ```
 
 ### Persistent Volume Pool

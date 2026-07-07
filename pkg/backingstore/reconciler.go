@@ -2,7 +2,6 @@ package backingstore
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/url"
 	"os"
@@ -26,7 +25,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -72,7 +71,7 @@ type Reconciler struct {
 	Scheme   *runtime.Scheme
 	Ctx      context.Context
 	Logger   *logrus.Entry
-	Recorder record.EventRecorder
+	Recorder events.EventRecorder
 	NBClient nb.Client
 
 	BackingStore     *nbv1.BackingStore
@@ -105,7 +104,7 @@ func NewReconciler(
 	req types.NamespacedName,
 	client client.Client,
 	scheme *runtime.Scheme,
-	recorder record.EventRecorder,
+	recorder events.EventRecorder,
 ) *Reconciler {
 
 	r := &Reconciler{
@@ -193,7 +192,7 @@ func (r *Reconciler) completeReconcile(err error) (reconcile.Result, error) {
 			r.SetPhase(nbv1.BackingStorePhaseRejected, perr.Reason, perr.Message)
 			log.Errorf("❌ Persistent Error: %s", err)
 			if r.Recorder != nil {
-				r.Recorder.Eventf(r.BackingStore, corev1.EventTypeWarning, perr.Reason, perr.Message)
+				r.Recorder.Eventf(r.BackingStore, nil, corev1.EventTypeWarning, perr.Reason, perr.Reason, perr.Message)
 			}
 		} else {
 			res.RequeueAfter = 3 * time.Second
@@ -211,7 +210,7 @@ func (r *Reconciler) completeReconcile(err error) (reconcile.Result, error) {
 				desc := fmt.Sprintf("Backing store mode: %s", mode)
 				r.SetPhase(phaseInfo.Phase, desc, phaseName)
 				if r.Recorder != nil {
-					r.Recorder.Eventf(r.BackingStore, phaseInfo.Severity, phaseName, desc)
+					r.Recorder.Eventf(r.BackingStore, nil, phaseInfo.Severity, phaseName, phaseName, desc)
 				}
 			}
 		} else {
@@ -254,7 +253,7 @@ func (r *Reconciler) ReconcilePhases() error {
 
 // LoadBackingStoreSecret loads the secret to the reconciler struct
 func (r *Reconciler) LoadBackingStoreSecret() error {
-	if util.IsSTSClusterBS(r.BackingStore) {
+	if util.IsAWSSTSClusterBS(r.BackingStore) {
 		return nil
 	}
 
@@ -687,7 +686,7 @@ func (r *Reconciler) MakeExternalConnectionParams() (*nb.AddExternalConnectionPa
 	switch r.BackingStore.Spec.Type {
 
 	case nbv1.StoreTypeAWSS3:
-		if util.IsSTSClusterBS(r.BackingStore) {
+		if util.IsAWSSTSClusterBS(r.BackingStore) {
 			conn.EndpointType = nb.EndpointTypeAwsSTS
 			conn.AWSSTSARN = *r.BackingStore.Spec.AWSS3.AWSSTSRoleARN
 		} else {
@@ -832,21 +831,28 @@ func (r *Reconciler) MakeExternalConnectionParams() (*nb.AddExternalConnectionPa
 		}
 
 	case nbv1.StoreTypeGoogleCloudStorage:
-		conn.EndpointType = nb.EndpointTypeGoogle
 		conn.Endpoint = "https://www.googleapis.com"
-		privateKeyJSON := r.Secret.StringData["GoogleServiceAccountPrivateKeyJson"]
-		privateKey := &struct {
-			ID string `json:"private_key_id"`
-		}{}
-		err := json.Unmarshal([]byte(privateKeyJSON), privateKey)
+		googleCredentialsJSON, err := util.GoogleCredentialsFromStoreSecret(r.Secret)
 		if err != nil {
 			return nil, util.NewPersistentError("InvalidGoogleSecret", fmt.Sprintf(
-				"Invalid secret for google type %q expected JSON in data.GoogleServiceAccountPrivateKeyJson",
-				r.Secret.Name,
+				"Invalid google credentials secret: %v", err,
 			))
 		}
-		conn.Identity = nb.MaskedString(privateKey.ID)
-		conn.Secret = nb.MaskedString(privateKeyJSON)
+
+		isGoogleExternalAccountJSON, identity, err := util.ParseGoogleCredentials(googleCredentialsJSON)
+		if err != nil {
+			return nil, util.NewPersistentError("InvalidGoogleSecret", fmt.Sprintf(
+				"Invalid secret for google type %q: invalid GCP credentials JSON: %v",
+				r.Secret.Name, err,
+			))
+		}
+		if isGoogleExternalAccountJSON {
+			conn.EndpointType = nb.EndpointTypeGoogleSTS
+		} else {
+			conn.EndpointType = nb.EndpointTypeGoogle
+		}
+		conn.Identity = nb.MaskedString(identity)
+		conn.Secret = nb.MaskedString(googleCredentialsJSON)
 
 	case nbv1.StoreTypePVPool:
 		return nil, util.NewPersistentError("InvalidType",
@@ -856,7 +862,7 @@ func (r *Reconciler) MakeExternalConnectionParams() (*nb.AddExternalConnectionPa
 		return nil, util.NewPersistentError("InvalidType",
 			fmt.Sprintf("Invalid backing store type %q", r.BackingStore.Spec.Type))
 	}
-	if !util.IsSTSClusterBS(r.BackingStore) {
+	if !util.IsAWSSTSClusterBS(r.BackingStore) {
 		if !util.IsStringGraphicOrSpacesCharsOnly(string(conn.Identity)) || !util.IsStringGraphicOrSpacesCharsOnly(string(conn.Secret)) {
 			return nil, util.NewPersistentError("InvalidSecret",
 				fmt.Sprintf("Invalid secret containing non graphic characters (perhaps not base64 encoded?) %q", r.Secret.Name))

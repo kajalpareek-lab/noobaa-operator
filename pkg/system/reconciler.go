@@ -35,7 +35,7 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -62,7 +62,7 @@ type Reconciler struct {
 	Scheme                   *runtime.Scheme
 	Ctx                      context.Context
 	Logger                   *logrus.Entry
-	Recorder                 record.EventRecorder
+	Recorder                 events.EventRecorder
 	NBClient                 nb.Client
 	CoreVersion              string
 	OperatorVersion          string
@@ -100,6 +100,7 @@ type Reconciler struct {
 	IsAzureSTSCluster         bool
 	GCPBucketCreds            *corev1.Secret
 	GCPCloudCreds             *cloudcredsv1.CredentialsRequest
+	IsGCPSTSCluster           bool
 	IBMCosBucketCreds         *corev1.Secret
 	DefaultBackingStore       *nbv1.BackingStore
 	DefaultBucketClass        *nbv1.BucketClass
@@ -131,6 +132,7 @@ type Reconciler struct {
 	ExternalPgSSLSecret       *corev1.Secret
 	BucketNotificationsPVC    *corev1.PersistentVolumeClaim
 	SecretMetricsAuth         *corev1.Secret
+	SecretOIDCKeyCloakConfig  *corev1.Secret
 	webIdentityTokenPath      string
 
 	// CNPG resources
@@ -143,7 +145,7 @@ func NewReconciler(
 	req types.NamespacedName,
 	client client.Client,
 	scheme *runtime.Scheme,
-	recorder record.EventRecorder,
+	recorder events.EventRecorder,
 ) *Reconciler {
 
 	r := &Reconciler{
@@ -206,7 +208,8 @@ func NewReconciler(
 		CNPGImageCatalog: cnpg.GetCnpgImageCatalogObj(req.Namespace, req.Name+pgImageCatalogSuffix),
 		CNPGCluster:      cnpg.GetCnpgClusterObj(req.Namespace, req.Name+pgClusterSuffix),
 
-		SecretMetricsAuth: util.KubeObject(bundle.File_deploy_internal_secret_empty_yaml).(*corev1.Secret),
+		SecretMetricsAuth:        util.KubeObject(bundle.File_deploy_internal_secret_empty_yaml).(*corev1.Secret),
+		SecretOIDCKeyCloakConfig: util.KubeObject(bundle.File_deploy_internal_secret_empty_yaml).(*corev1.Secret),
 	}
 
 	// Set Namespace
@@ -260,6 +263,7 @@ func NewReconciler(
 	r.BucketLoggingPVC.Namespace = r.Request.Namespace
 	r.BucketNotificationsPVC.Namespace = r.Request.Namespace
 	r.SecretMetricsAuth.Namespace = r.Request.Namespace
+	r.SecretOIDCKeyCloakConfig.Namespace = r.Request.Namespace
 
 	// Set Names
 	r.NooBaa.Name = r.Request.Name
@@ -310,6 +314,7 @@ func NewReconciler(
 	r.BucketLoggingPVC.Name = r.Request.Name + "-bucket-logging-pvc"
 	r.BucketNotificationsPVC.Name = r.Request.Name + "-bucket-notifications-pvc"
 	r.SecretMetricsAuth.Name = r.Request.Name + "-metrics-auth-secret"
+	r.SecretOIDCKeyCloakConfig.Name = r.Request.Name + "-oidc-keycloak-config"
 
 	// Set the target service for routes.
 	r.RouteMgmt.Spec.To.Name = r.ServiceMgmt.Name
@@ -335,13 +340,16 @@ func NewReconciler(
 	// Setting default AWS STS cluster as false
 	r.IsAWSSTSCluster = false
 
+	// Setting default GCP WIF (STS) cluster as false
+	r.IsGCPSTSCluster = false
+
 	// Set bucket logging volume mount name and path
 	r.BucketLoggingVolume = r.Request.Name + "-bucket-logging-volume"
 	r.BucketLoggingVolumeMount = "/var/logs/bucket-logs"
 
 	r.DefaultCoreApp = r.CoreApp.Spec.Template.Spec.DeepCopy()
 	r.DefaultDeploymentEndpoint = r.DeploymentEndpoint.Spec.Template.Spec.DeepCopy()
-	r.webIdentityTokenPath = "/var/run/secrets/openshift/serviceaccount/token"
+	r.webIdentityTokenPath = util.WebIdentityTokenPath
 
 	return r
 }
@@ -497,7 +505,7 @@ func (r *Reconciler) Reconcile() (reconcile.Result, error) {
 			r.SetPhase(nbv1.SystemPhaseRejected, perr.Reason, perr.Message)
 			log.Errorf("❌ Persistent Error: %s", err)
 			if r.Recorder != nil {
-				r.Recorder.Eventf(r.NooBaa, corev1.EventTypeWarning, perr.Reason, perr.Message)
+				r.Recorder.Eventf(r.NooBaa, nil, corev1.EventTypeWarning, perr.Reason, perr.Reason, perr.Message)
 			}
 		} else {
 			res.RequeueAfter = 3 * time.Second
@@ -791,4 +799,8 @@ func (r *Reconciler) GetAffinity() *corev1.Affinity {
 		PodAffinity:     r.NooBaa.Spec.Affinity.PodAffinity,
 		PodAntiAffinity: r.NooBaa.Spec.Affinity.PodAntiAffinity,
 	}
+}
+
+func (r *Reconciler) getEndpointMinMaxCount() (int32, int32) {
+	return getEndpointMinMax(r.NooBaa)
 }

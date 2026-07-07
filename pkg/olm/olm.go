@@ -278,6 +278,8 @@ func GenerateCSV(opConf *operator.Conf, csvParams *generateCSVParams) *operv1.Cl
 	csv.Annotations["features.operators.openshift.io/token-auth-aws"] = "true"
 	// annotation for Azure managed identity STS cluster
 	csv.Annotations["features.operators.openshift.io/token-auth-azure"] = "true"
+	// annotation for OpenShift GCP WIF (STS) cluster
+	csv.Annotations["features.operators.openshift.io/token-auth-gcp"] = "true"
 	csv.Annotations["capabilities"] = "Seamless Upgrades"
 	csv.Spec.Version.Version = semver.MustParse(version.Version)
 	csv.Spec.Description = bundle.File_deploy_olm_description_md
@@ -415,6 +417,7 @@ func GenerateCSV(opConf *operator.Conf, csvParams *generateCSVParams) *operv1.Cl
 		uiFieldGroupIBMCos             = uiFieldGroup + "ibmCos"
 		uiFieldGroupPlacementPolicy    = uiFieldGroup + "placementPolicy"
 		uiFieldGroupNamespacePolicy    = uiFieldGroup + "namespacePolicy"
+		uiFieldGroupArchivePolicy      = uiFieldGroup + "archivePolicy"
 	)
 
 	crdSpecDescriptors := map[string][]operv1.SpecDescriptor{
@@ -514,7 +517,10 @@ func GenerateCSV(opConf *operator.Conf, csvParams *generateCSVParams) *operv1.Cl
 				DisplayName:  "Target Blob Container",
 			},
 			{
-				Description:  "Secret refers to a secret that provides the credentials. The secret should define GoogleServiceAccountPrivateKeyJson containing\nthe entire json string as provided by Google.",
+				Description: "Secret refers to a secret that provides the credentials. " +
+					"For classic google-cloud-storage, define GoogleServiceAccountPrivateKeyJson " +
+					"containing service_account JSON as provided by Google. " +
+					"For GCP WIF (STS), define GoogleCredentialsJson containing external_account JSON.",
 				Path:         "googleCloudStorage.secret.name",
 				XDescriptors: []string{uiFieldGroupGoogleCloudStorage, uiK8sSecret},
 				DisplayName:  "Secret",
@@ -655,6 +661,12 @@ func GenerateCSV(opConf *operator.Conf, csvParams *generateCSVParams) *operv1.Cl
 				DisplayName:  "Target Bucket",
 			},
 			{
+				Description:  "Archive specifies if the namespace store should be used for archiving. If true, the namespace store will be used for archiving and not for regular data storage.",
+				Path:         "archive",
+				XDescriptors: []string{uiBooleanSwitch},
+				DisplayName:  "Archive",
+			},
+			{
 				Description:  "Endpoint is the IBM COS endpoint: http(s)://host:port.",
 				Path:         "IBMCos.endpoint",
 				XDescriptors: []string{uiFieldGroupIBMCos, uiText},
@@ -722,6 +734,12 @@ func GenerateCSV(opConf *operator.Conf, csvParams *generateCSVParams) *operv1.Cl
 				Path:         "namespacePolicy.Cache.hubResource",
 				XDescriptors: []string{uiFieldGroupNamespacePolicy, uiText},
 				DisplayName:  "Hub Resource",
+			},
+			{
+				Description:  "DeepArchiveResource specifies the namespace store configured by the archivePolicy.",
+				Path:         "archivePolicy.deepArchiveResource",
+				XDescriptors: []string{uiFieldGroupArchivePolicy, uiText},
+				DisplayName:  "Deep Archive Resource",
 			},
 		},
 

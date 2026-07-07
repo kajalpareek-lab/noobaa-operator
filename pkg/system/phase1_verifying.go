@@ -78,6 +78,10 @@ func (r *Reconciler) ReconcilePhaseVerifying() error {
 		}
 	}
 
+	if err := util.ValidateTLSSpec(r.NooBaa.Spec.Security.APIServerSecurity); err != nil {
+		return util.NewPersistentError("InvalidTLSConfiguration", err.Error())
+	}
+
 	return nil
 }
 
@@ -154,12 +158,12 @@ func (r *Reconciler) CheckSystemCR() error {
 	// Verify the endpoints spec
 	endpointsSpec := r.NooBaa.Spec.Endpoints
 	if endpointsSpec != nil {
-		if endpointsSpec.MinCount <= 0 {
+		minCount, maxCount := getEndpointMinMax(r.NooBaa)
+		if minCount <= 0 {
 			return util.NewPersistentError("InvalidEndpointsConfiguration",
 				"Invalid endpoint min count (must be greater than 0)")
 		}
-		// Validate bounds on endpoint counts
-		if endpointsSpec.MinCount > endpointsSpec.MaxCount {
+		if minCount > maxCount {
 			return util.NewPersistentError("InvalidEndpointsConfiguration",
 				"Invalid endpoint maximum count (must be higher than or equal to minimum count)")
 		}
@@ -200,20 +204,17 @@ func (r *Reconciler) CheckJoinSecret() error {
 		return util.NewPersistentError("InvalidJoinSecert",
 			"JoinSecret is missing auth_token")
 	}
-
-	if !util.IsRemoteClientNoobaa(r.NooBaa.GetAnnotations()) {
-		if r.JoinSecret.StringData["bg_addr"] == "" {
-			return util.NewPersistentError("InvalidJoinSecert",
-				"JoinSecret is missing bg_addr")
-		}
-		if r.JoinSecret.StringData["md_addr"] == "" {
-			return util.NewPersistentError("InvalidJoinSecert",
-				"JoinSecret is missing md_addr")
-		}
-		if r.JoinSecret.StringData["hosted_agents_addr"] == "" {
-			return util.NewPersistentError("InvalidJoinSecert",
-				"JoinSecret is missing hosted_agents_addr")
-		}
+	if r.JoinSecret.StringData["bg_addr"] == "" {
+		return util.NewPersistentError("InvalidJoinSecert",
+			"JoinSecret is missing bg_addr")
+	}
+	if r.JoinSecret.StringData["md_addr"] == "" {
+		return util.NewPersistentError("InvalidJoinSecert",
+			"JoinSecret is missing md_addr")
+	}
+	if r.JoinSecret.StringData["hosted_agents_addr"] == "" {
+		return util.NewPersistentError("InvalidJoinSecert",
+			"JoinSecret is missing hosted_agents_addr")
 	}
 	return nil
 }

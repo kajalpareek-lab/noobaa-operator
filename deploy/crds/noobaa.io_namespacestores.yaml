@@ -54,6 +54,11 @@ spec:
               accessMode:
                 description: AccessMode is an enum of supported access modes
                 type: string
+              archive:
+                description: |-
+                  Archive marks the namespace store for cold-storage archive use (e.g. IBM Deep Archive).
+                  Only valid with type s3-compatible.
+                type: boolean
               awsS3:
                 description: AWSS3Spec specifies a namespace store of type aws-s3
                 properties:
@@ -134,8 +139,9 @@ spec:
                 properties:
                   secret:
                     description: |-
-                      Secret refers to a secret that provides the credentials
-                      The secret should define GoogleServiceAccountPrivateKeyJson containing the entire json string as provided by Google.
+                      Secret refers to a secret that provides the credentials.
+                      For classic google-cloud-storage, define GoogleServiceAccountPrivateKeyJson (service_account JSON).
+                      For GCP WIF (STS), define GoogleCredentialsJson (external_account JSON).
                     properties:
                       name:
                         description: name is unique within a namespace to reference

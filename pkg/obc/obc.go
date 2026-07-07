@@ -443,7 +443,7 @@ func RunStatus(cmd *cobra.Command, args []string) {
 		}
 	}
 
-	sysClient, err := system.Connect(true)
+	sysClient, err := system.ConnectAuto()
 	if err != nil {
 		util.Logger().Fatalf("❌ %s", err)
 	}
@@ -520,8 +520,8 @@ func RunStatus(cmd *cobra.Command, args []string) {
 		if b.DataCapacity != nil {
 			fmt.Printf("  %-22s : %s\n", "Data Size", nb.BigIntToHumanBytes(b.DataCapacity.Size))
 			fmt.Printf("  %-22s : %s\n", "Data Size Reduced", nb.BigIntToHumanBytes(b.DataCapacity.SizeReduced))
-			fmt.Printf("  %-22s : %s\n", "Data Space Avail", nb.BigIntToHumanBytes(b.DataCapacity.AvailableSizeToUpload))
-			fmt.Printf("  %-22s : %s\n", "Num Objects Avail", b.DataCapacity.AvailableQuantityToUpload.ToString())
+			fmt.Printf("  %-22s : %s\n", "Data Space Avail", nb.BigIntToNonNegativeHumanBytes(b.DataCapacity.AvailableSizeToUpload))
+			fmt.Printf("  %-22s : %s\n", "Num Objects Avail", nb.BigIntToNonNegativeString(b.DataCapacity.AvailableQuantityToUpload))
 		}
 		nb.WarnIfQuotaCappedByFree(b.Name, b, nil, b.Quota, func(format string, args ...interface{}) {
 			fmt.Fprintf(os.Stderr, "Warning: "+format+"\n", args...)
@@ -658,7 +658,7 @@ func GenerateAccountKeys(name, accountName, appNamespace string) error {
 
 	var accessKeys nb.S3AccessKeys
 
-	sysClient, err := system.Connect(true)
+	sysClient, err := system.ConnectAuto()
 	if err != nil {
 		return err
 	}
