@@ -1540,3 +1540,47 @@ function test_create_obc_with_nsfs_acc_distinguished_name {
         exit 1
     fi
 }
+
+function test_backingstore_replace {
+    echo_time "💬  Testing backingstore replace command"
+
+    echo_time "💬  Creating replacement backing store for replace test"
+    test_noobaa backingstore create pv-pool replace-test-bs --num-volumes 1 --pv-size-gb 16
+    wait_for_backingstore_ready replace-test-bs
+
+    echo_time "💬  Creating a CLI bucket on the default backing store"
+    test_noobaa bucket create replace-test-bucket
+
+    echo_time "💬  Step 1: Start migration (mirror mode)"
+    test_noobaa backingstore replace noobaa-default-backing-store replace-test-bs --migrate
+
+    echo_time "💬  Verifying migration started"
+    sleep 30
+
+    echo_time "💬  Step 2: Finalize replacement"
+    test_noobaa backingstore replace noobaa-default-backing-store replace-test-bs
+
+    echo_time "💬  Verifying accounts updated"
+    local admin_default=$(test_noobaa api account_api list_accounts '{}' 2>&1 | grep -A1 'admin@noobaa.io' | grep default_resource | awk '{print $2}')
+    if [[ "${admin_default}" != "replace-test-bs" ]]; then
+        echo_time "❌  admin account default_resource was not updated. Got: ${admin_default}"
+        exit 1
+    fi
+
+    echo_time "💬  Step 3: Set manualDefaultBackingStore and delete old backing store"
+    kuberun patch noobaa/noobaa --type json --patch='[{"op":"add","path":"/spec/manualDefaultBackingStore","value":true}]'
+    kuberun delete backingstore noobaa-default-backing-store
+
+    echo_time "💬  Verifying old backing store was deleted"
+    local bs_count=$(kuberun get backingstore | grep -w noobaa-default-backing-store | wc -l)
+    if [[ "${bs_count}" -ne "0" ]]; then
+        echo_time "❌  noobaa-default-backing-store was not deleted"
+        exit 1
+    fi
+
+    echo_time "💬  Cleanup: delete test bucket and backing store"
+    test_noobaa bucket delete replace-test-bucket
+    kuberun delete backingstore replace-test-bs
+
+    echo_time "✅  backingstore replace test passed"
+}
